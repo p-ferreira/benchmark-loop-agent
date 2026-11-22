@@ -25,6 +25,22 @@ REQUEST_TIMEOUT_SECONDS = 120
 ANTHROPIC_MAX_TOKENS = 1024  # required by the Messages API; ample for one tool call
 
 
+MAX_ARGUMENT_DEPTH = 50  # far deeper than any real function schema; bounds every later recursion
+
+
+def too_deep(value: Any, limit: int = MAX_ARGUMENT_DEPTH) -> bool:
+    """True if lists/dicts inside ``value`` nest deeper than ``limit``. Iterative, so it cannot recurse."""
+    stack = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        if isinstance(item, (list, dict)):
+            if depth > limit:
+                return True
+            children = item.values() if isinstance(item, dict) else item
+            stack.extend((child, depth + 1) for child in children)
+    return False
+
+
 class ProviderError(Exception):
     """The API call itself failed (network, HTTP error, unusable response)."""
 
@@ -117,6 +133,10 @@ def request_openai(api_key: str, model: str, case: PinnedCase, post: PostJson) -
                 malformed.append(f"arguments for {name} are not a JSON object")
                 unscorable.append({name: raw_arguments})
                 continue
+            if too_deep(arguments):
+                malformed.append(f"arguments for {name} are nested too deeply")
+                unscorable.append({name: raw_arguments})
+                continue
             calls.append({name: arguments})
         return ProviderResponse(
             reply.get("model"), calls, usage.get("prompt_tokens"), usage.get("completion_tokens"), malformed, unscorable
@@ -155,7 +175,10 @@ def request_anthropic(api_key: str, model: str, case: PinnedCase, post: PostJson
         for block in reply["content"]:
             if block["type"] != "tool_use":
                 continue
-            if isinstance(block["input"], dict):
+            if isinstance(block["input"], dict) and too_deep(block["input"]):
+                malformed.append(f"input for {block['name']} is nested too deeply")
+                unscorable.append({block["name"]: "<input nested too deeply to print>"})
+            elif isinstance(block["input"], dict):
                 calls.append({block["name"]: block["input"]})
             else:
                 malformed.append(f"input for {block['name']} is not a JSON object")

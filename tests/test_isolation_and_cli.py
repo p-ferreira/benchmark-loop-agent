@@ -130,6 +130,26 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertIn("unrepresentable_number", json.dumps(data["returned_calls"]))
 
+    def test_deeply_nested_valid_arguments_still_yield_both_records(self) -> None:
+        raw = '{"base":' + "[" * 992 + "0" + "]" * 992 + ',"height":5}'
+        deep: object = 0
+        for _ in range(992):
+            deep = [deep]
+
+        def post(url, headers, body):
+            return openai_reply(raw) if "openai" in url else anthropic_reply({"base": deep, "height": 5})
+
+        out = io.StringIO()
+        env = {**environment("openai"), **environment("anthropic")}
+        with mock.patch.dict("os.environ", env, clear=True), \
+                mock.patch.object(cli, "post_json", post), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = cli.main([])
+        records = [json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertEqual([r["provider"] for r in records], ["openai", "anthropic"])
+        self.assertEqual([r["outcome"] for r in records], ["fail", "fail"])
+        self.assertEqual(code, 1)
+
     def test_provider_flag_limits_the_run(self) -> None:
         out = io.StringIO()
         with mock.patch.dict("os.environ", {}, clear=True), contextlib.redirect_stdout(out), \
