@@ -150,6 +150,22 @@ class CliTests(unittest.TestCase):
         self.assertEqual([r["outcome"] for r in records], ["fail", "fail"])
         self.assertEqual(code, 1)
 
+    def test_deep_anthropic_input_is_printed_with_its_leaf(self) -> None:
+        deep: object = {"leaf": 42}
+        for _ in range(60):
+            deep = {"child": deep}
+        out = io.StringIO()
+        with mock.patch.dict("os.environ", environment("anthropic"), clear=True), \
+                mock.patch.object(cli, "post_json", FakePost(anthropic_reply(deep))), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            cli.main(["--provider", "anthropic"])
+        record = json.loads(out.getvalue())
+        self.assertEqual(record["outcome"], "fail")
+        text = json.dumps(record["returned_calls"])
+        self.assertIn("leaf", text)
+        self.assertIn("42", text)
+        self.assertNotIn("too deeply to print", text)
+
     def test_provider_flag_limits_the_run(self) -> None:
         out = io.StringIO()
         with mock.patch.dict("os.environ", {}, clear=True), contextlib.redirect_stdout(out), \

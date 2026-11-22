@@ -41,6 +41,14 @@ def too_deep(value: Any, limit: int = MAX_ARGUMENT_DEPTH) -> bool:
     return False
 
 
+def printable_text(value: Any) -> str:
+    """JSON text of ``value`` for the reader; placeholder only if it cannot be encoded."""
+    try:
+        return json.dumps(value)
+    except (ValueError, RecursionError, TypeError):
+        return "<input could not be encoded for printing>"
+
+
 class ProviderError(Exception):
     """The API call itself failed (network, HTTP error, unusable response)."""
 
@@ -177,7 +185,7 @@ def request_anthropic(api_key: str, model: str, case: PinnedCase, post: PostJson
                 continue
             if isinstance(block["input"], dict) and too_deep(block["input"]):
                 malformed.append(f"input for {block['name']} is nested too deeply")
-                unscorable.append({block["name"]: "<input nested too deeply to print>"})
+                unscorable.append({block["name"]: printable_text(block["input"])})
             elif isinstance(block["input"], dict):
                 calls.append({block["name"]: block["input"]})
             else:
