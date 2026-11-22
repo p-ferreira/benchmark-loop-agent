@@ -150,6 +150,32 @@ class AdapterTests(unittest.TestCase):
                 self.assertNotIn(SECRET, json.dumps(record.to_dict()))
                 self.assertIn("[redacted]", record.reasons[0])
 
+    def test_key_crossing_the_reason_cutoff_is_fully_redacted(self) -> None:
+        from benchmark_loop_agent.runner import MAX_REASON_LENGTH
+
+        for offset in range(len(SECRET) + 1):
+            with self.subTest(offset=offset):
+                prefix = "x" * (MAX_REASON_LENGTH - len("RuntimeError: ") - offset)
+                record, _ = self.run_case("openai", RuntimeError(prefix + SECRET))
+                reason = record.reasons[0]
+                self.assertLessEqual(len(reason), MAX_REASON_LENGTH)
+                for n in range(4, len(SECRET) + 1):
+                    self.assertNotIn(SECRET[:n], reason)
+
+    def test_long_http_error_body_is_not_truncated_before_redaction(self) -> None:
+        import io
+        import urllib.error
+        from unittest import mock
+
+        from benchmark_loop_agent.providers import post_json
+
+        body = ("y" * 495 + SECRET).encode()
+        error = urllib.error.HTTPError("https://example.invalid", 401, "x", {}, io.BytesIO(body))
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(ProviderError) as caught:
+                post_json("https://example.invalid", {}, {})
+        self.assertIn(SECRET, str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

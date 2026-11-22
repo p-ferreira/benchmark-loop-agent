@@ -73,7 +73,8 @@ def run_provider(
             scorer_revision=SCORER_REVISION,
             returned_calls=calls,
             outcome=outcome,
-            reasons=[reason[:MAX_REASON_LENGTH] for reason in reasons],
+            # Redact first: truncating first could leave a key's first characters behind.
+            reasons=[redact(reason, secrets)[:MAX_REASON_LENGTH] for reason in reasons],
             latency_seconds=latency,
             input_tokens=response.input_tokens if response else None,
             output_tokens=response.output_tokens if response else None,

@@ -57,7 +57,9 @@ def post_json(url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[s
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
             return json.loads(response.read())
     except urllib.error.HTTPError as error:
-        raise ProviderError(f"HTTP {error.code}: {error.read().decode(errors='replace')[:500]}") from None
+        # Not truncated here: the runner redacts keys, then truncates, so a key
+        # can never be cut in half and slip past redaction.
+        raise ProviderError(f"HTTP {error.code}: {error.read().decode(errors='replace')}") from None
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
         raise ProviderError(f"{type(error).__name__}: {error}") from None
 
