@@ -67,6 +67,15 @@ class ProviderIsolationTests(unittest.TestCase):
         for field_name in ("outcome", "returned_calls", "actual_model", "input_tokens", "reasons"):
             self.assertEqual(getattr(both[1], field_name), getattr(alone[0], field_name))
 
+    def test_non_object_arguments_from_one_provider_do_not_stop_the_other(self) -> None:
+        env = {**environment("openai"), **environment("anthropic")}
+
+        def post(url, headers, body):
+            return openai_reply("null") if "openai" in url else anthropic_reply(RIGHT)
+
+        records = run_providers(["openai", "anthropic"], load_case(), env, post)
+        self.assertEqual([r.outcome for r in records], ["fail", "pass"])
+
     def test_missing_credentials_for_both_still_yield_two_records(self) -> None:
         records = run_providers(["openai", "anthropic"], load_case(), {}, FakePost(RuntimeError("no")))
         self.assertEqual([r.outcome for r in records], ["unscored", "unscored"])

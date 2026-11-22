@@ -71,6 +71,36 @@ class AdapterTests(unittest.TestCase):
         record, _ = self.run_case("openai", openai_reply("{not json"))
         self.assertEqual(record.outcome, "fail")
 
+    def test_openai_non_object_arguments_fail_and_keep_the_call(self) -> None:
+        for raw in ("null", "1", "[1]"):
+            with self.subTest(raw=raw):
+                record, _ = self.run_case("openai", openai_reply(raw))
+                self.assertEqual(record.outcome, "fail")
+                self.assertEqual(record.returned_calls, [{NAME: raw}])
+
+    def test_openai_malformed_arguments_are_retained_raw(self) -> None:
+        record, _ = self.run_case("openai", openai_reply("{bad"))
+        self.assertEqual(record.outcome, "fail")
+        self.assertEqual(record.returned_calls, [{NAME: "{bad"}])
+
+    def test_anthropic_non_object_input_fails_and_keeps_the_call(self) -> None:
+        reply = anthropic_reply({})
+        reply["content"][0]["input"] = "oops"
+        record, _ = self.run_case("anthropic", reply)
+        self.assertEqual(record.outcome, "fail")
+        self.assertEqual(record.returned_calls, [{NAME: "oops"}])
+
+    def test_keys_echoed_in_a_successful_response_are_redacted_everywhere(self) -> None:
+        other = "sk-ant-OTHER-456"
+        arguments = json.dumps({**RIGHT, "unit": f"{SECRET} {other}"})
+        post = FakePost(openai_reply(arguments))
+        env = {**environment("openai"), "ANTHROPIC_API_KEY": other}
+        record = run_provider("openai", load_case(), env, post)
+        text = json.dumps(record.to_dict())
+        self.assertNotIn(SECRET, text)
+        self.assertNotIn(other, text)
+        self.assertIn("[redacted]", text)
+
     def test_anthropic_pass(self) -> None:
         record, post = self.run_case("anthropic", anthropic_reply(RIGHT))
         self.assertEqual(record.outcome, "pass")

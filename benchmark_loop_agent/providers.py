@@ -37,9 +37,12 @@ class ProviderResponse:
     calls: list[BfclCall]
     input_tokens: int | None
     output_tokens: int | None
-    # Tool calls we could not turn into a BFCL call (e.g. arguments that are not
-    # JSON). The response succeeded, so these count as a wrong answer, not an error.
+    # Tool calls we could not turn into a BFCL call (arguments that are not a JSON
+    # object). The response succeeded, so these count as a wrong answer, not an
+    # error. ``malformed`` says why; ``unscorable_calls`` keeps each call's name
+    # and raw arguments for the reader. They never reach the BFCL checker.
     malformed: list[str] = field(default_factory=list)
+    unscorable_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 def post_json(url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
@@ -95,17 +98,24 @@ def request_openai(api_key: str, model: str, case: PinnedCase, post: PostJson) -
         usage = reply.get("usage") or {}
         calls: list[BfclCall] = []
         malformed: list[str] = []
+        unscorable: list[dict[str, Any]] = []
         for tool_call in message.get("tool_calls") or []:
             name = tool_call["function"]["name"]
             # OpenAI returns the arguments as a JSON *string*.
+            raw_arguments = tool_call["function"]["arguments"]
             try:
-                arguments = json.loads(tool_call["function"]["arguments"])
-            except json.JSONDecodeError:
+                arguments = json.loads(raw_arguments)
+            except (json.JSONDecodeError, TypeError):
                 malformed.append(f"arguments for {name} are not valid JSON")
+                unscorable.append({name: raw_arguments})
+                continue
+            if not isinstance(arguments, dict):
+                malformed.append(f"arguments for {name} are not a JSON object")
+                unscorable.append({name: raw_arguments})
                 continue
             calls.append({name: arguments})
         return ProviderResponse(
-            reply.get("model"), calls, usage.get("prompt_tokens"), usage.get("completion_tokens"), malformed
+            reply.get("model"), calls, usage.get("prompt_tokens"), usage.get("completion_tokens"), malformed, unscorable
         )
     except (KeyError, IndexError, TypeError) as error:
         raise ProviderError(f"unexpected OpenAI response shape: {type(error).__name__}: {error}") from None
@@ -135,9 +145,19 @@ def request_anthropic(api_key: str, model: str, case: PinnedCase, post: PostJson
     try:
         usage = reply.get("usage") or {}
         # Tool calls are "tool_use" blocks in the content list; "input" is already a dict.
-        calls: list[BfclCall] = [
-            {block["name"]: block["input"]} for block in reply["content"] if block["type"] == "tool_use"
-        ]
-        return ProviderResponse(reply.get("model"), calls, usage.get("input_tokens"), usage.get("output_tokens"))
+        calls: list[BfclCall] = []
+        malformed: list[str] = []
+        unscorable: list[dict[str, Any]] = []
+        for block in reply["content"]:
+            if block["type"] != "tool_use":
+                continue
+            if isinstance(block["input"], dict):
+                calls.append({block["name"]: block["input"]})
+            else:
+                malformed.append(f"input for {block['name']} is not a JSON object")
+                unscorable.append({block["name"]: block["input"]})
+        return ProviderResponse(
+            reply.get("model"), calls, usage.get("input_tokens"), usage.get("output_tokens"), malformed, unscorable
+        )
     except (KeyError, TypeError) as error:
         raise ProviderError(f"unexpected Anthropic response shape: {type(error).__name__}: {error}") from None
