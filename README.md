@@ -47,7 +47,7 @@ per provider goes to stderr.
 | `provider`, `requested_model` | provider name and the model ID from `*_MODEL` (`null` if unset) |
 | `actual_model` | model name as the response reports it (`null` if no response) |
 | `case_id`, `dataset_revision`, `scorer_revision` | what was run and the pinned sources |
-| `returned_calls` | tool calls as `{function: {param: value}}`; `null` when unscored |
+| `returned_calls` | tool calls as `{function: {param: value}}`; `null` when unscored. A non-finite number (e.g. `1e400`) is written as `{"unrepresentable_number": "Infinity"}` so the line stays strict JSON |
 | `outcome` | `pass`, `fail` (response arrived; call wrong or missing) or `unscored` (API call failed, including a missing key or model) |
 | `reasons` | why it failed or was not scored; empty on pass |
 | `latency_seconds` | request time; `null` if no request was made |

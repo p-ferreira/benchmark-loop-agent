@@ -112,6 +112,24 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertNotIn(SECRET, out.getvalue() + err.getvalue())
 
+    def test_non_finite_arguments_still_emit_strictly_valid_json(self) -> None:
+        def reject_constant(token: str) -> None:
+            raise AssertionError(f"non-JSON token {token}")
+
+        replies = {"openai": openai_reply('{"base": 1e400, "height": -1e400}'),
+                   "anthropic": anthropic_reply({"base": float("inf"), "height": float("nan")})}
+        for provider, reply in replies.items():
+            with self.subTest(provider=provider):
+                out = io.StringIO()
+                with mock.patch.dict("os.environ", environment(provider), clear=True), \
+                        mock.patch.object(cli, "post_json", FakePost(reply)), \
+                        contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    code = cli.main(["--provider", provider])
+                data = json.loads(out.getvalue(), parse_constant=reject_constant)
+                self.assertEqual(data["outcome"], "fail")
+                self.assertEqual(code, 1)
+                self.assertIn("unrepresentable_number", json.dumps(data["returned_calls"]))
+
     def test_provider_flag_limits_the_run(self) -> None:
         out = io.StringIO()
         with mock.patch.dict("os.environ", {}, clear=True), contextlib.redirect_stdout(out), \

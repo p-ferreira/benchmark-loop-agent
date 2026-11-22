@@ -1,5 +1,6 @@
 """The machine-readable record emitted for each provider."""
 
+import math
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
@@ -29,4 +30,23 @@ class Record:
     output_tokens: int | None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        """The record as strictly valid JSON data (see ``json_safe``)."""
+        return json_safe(asdict(self))
+
+
+def json_safe(value: Any) -> Any:
+    """Replace floats JSON cannot express with a marker object.
+
+    A model may return an argument such as ``1e400``: valid JSON on input, but
+    Python reads it as ``inf``, which ``json.dumps`` would write as the invalid
+    token ``Infinity``. The marker ``{"unrepresentable_number": "Infinity"}``
+    keeps the record consumable by strict readers and still shows what came back.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        name = "NaN" if math.isnan(value) else "Infinity" if value > 0 else "-Infinity"
+        return {"unrepresentable_number": name}
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    return value
