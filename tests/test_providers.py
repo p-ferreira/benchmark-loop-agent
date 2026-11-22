@@ -15,10 +15,15 @@ NAME = "calculate_triangle_area"
 
 
 def openai_reply(arguments: Any) -> dict[str, Any]:
+    """A Responses API reply: one tool call among the other item types the API returns."""
     return {
         "model": "gpt-actual",
-        "choices": [{"message": {"tool_calls": [{"function": {"name": NAME, "arguments": arguments}}]}}],
-        "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+        "output": [
+            {"type": "reasoning", "summary": []},
+            {"type": "function_call", "name": NAME, "arguments": arguments, "call_id": "call_1"},
+            {"type": "message", "content": [{"type": "output_text", "text": "done"}]},
+        ],
+        "usage": {"input_tokens": 7, "output_tokens": 3},
     }
 
 
@@ -58,9 +63,13 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual((record.requested_model, record.actual_model), ("requested-model", "gpt-actual"))
         self.assertEqual((record.input_tokens, record.output_tokens), (7, 3))
         url, headers, body = post.requests[0]
-        self.assertIn("openai.com", url)
+        self.assertEqual(url, "https://api.openai.com/v1/responses")
         self.assertEqual(headers["authorization"], f"Bearer {SECRET}")
-        self.assertEqual(body["tools"][0]["function"]["parameters"]["type"], "object")
+        tool = body["tools"][0]
+        self.assertEqual((tool["type"], tool["name"], tool["parameters"]["type"]), ("function", NAME, "object"))
+        # Optional BFCL parameters stay optional: strict mode would reject the schema.
+        self.assertIs(tool["strict"], False)
+        self.assertEqual(body["input"], [{"role": "user", "content": load_case().prompt}])
 
     def test_openai_fail_wrong_value(self) -> None:
         record, _ = self.run_case("openai", openai_reply(json.dumps(WRONG)))

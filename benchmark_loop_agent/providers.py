@@ -102,33 +102,44 @@ def json_schema_parameters(bfcl_parameters: dict[str, Any]) -> dict[str, Any]:
 
 
 def request_openai(api_key: str, model: str, case: PinnedCase, post: PostJson) -> ProviderResponse:
-    """Call OpenAI Chat Completions with the case's function as a tool."""
-    # OpenAI wraps each tool as {"type": "function", "function": {...}} and takes
-    # the schema under "parameters". Anthropic differs; see request_anthropic.
+    """Call the OpenAI Responses API with the case's function as a tool."""
+    # The Responses API is used because OpenAI's current reasoning models refuse
+    # function tools on the older Chat Completions endpoint. Its tools are flat
+    # ({"type": "function", "name": ...}) with the schema under "parameters".
+    # Anthropic differs; see request_anthropic.
     tools = [
         {
             "type": "function",
-            "function": {
-                "name": f["name"],
-                "description": f["description"],
-                "parameters": json_schema_parameters(f["parameters"]),
-            },
+            "name": f["name"],
+            "description": f["description"],
+            "parameters": json_schema_parameters(f["parameters"]),
+            # Strict mode would require every parameter to be listed as required.
+            # BFCL schemas have optional parameters, so the schema is sent as written.
+            "strict": False,
         }
         for f in case.functions
     ]
-    body = {"model": model, "messages": [{"role": "user", "content": case.prompt}], "tools": tools}
-    reply = post("https://api.openai.com/v1/chat/completions", {"authorization": f"Bearer {api_key}"}, body)
+    body = {
+        "model": model,
+        "input": [{"role": "user", "content": case.prompt}],
+        "tools": tools,
+        "store": False,  # a benchmark request has no reason to be kept by the provider
+    }
+    reply = post("https://api.openai.com/v1/responses", {"authorization": f"Bearer {api_key}"}, body)
 
     try:
-        message = reply["choices"][0]["message"]
         usage = reply.get("usage") or {}
         calls: list[BfclCall] = []
         malformed: list[str] = []
         unscorable: list[dict[str, Any]] = []
-        for tool_call in message.get("tool_calls") or []:
-            name = tool_call["function"]["name"]
+        # The reply's "output" list mixes item types (reasoning, text, tool calls).
+        # Only "function_call" items are tool calls.
+        for item in reply["output"]:
+            if item["type"] != "function_call":
+                continue
+            name = item["name"]
             # OpenAI returns the arguments as a JSON *string*.
-            raw_arguments = tool_call["function"]["arguments"]
+            raw_arguments = item["arguments"]
             try:
                 arguments = json.loads(raw_arguments)
             except (ValueError, RecursionError, TypeError):
@@ -147,7 +158,7 @@ def request_openai(api_key: str, model: str, case: PinnedCase, post: PostJson) -
                 continue
             calls.append({name: arguments})
         return ProviderResponse(
-            reply.get("model"), calls, usage.get("prompt_tokens"), usage.get("completion_tokens"), malformed, unscorable
+            reply.get("model"), calls, usage.get("input_tokens"), usage.get("output_tokens"), malformed, unscorable
         )
     except (KeyError, IndexError, TypeError) as error:
         raise ProviderError(f"unexpected OpenAI response shape: {type(error).__name__}: {error}") from None
