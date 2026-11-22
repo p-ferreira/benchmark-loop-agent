@@ -183,7 +183,7 @@ def request_anthropic(api_key: str, model: str, case: PinnedCase, post: PostJson
         for block in reply["content"]:
             if block["type"] != "tool_use":
                 continue
-            if isinstance(block["input"], dict) and too_deep(block["input"]):
+            if too_deep(block["input"]):  # lists too: deep non-objects must not reach recursive redaction
                 malformed.append(f"input for {block['name']} is nested too deeply")
                 unscorable.append({block["name"]: printable_text(block["input"])})
             elif isinstance(block["input"], dict):

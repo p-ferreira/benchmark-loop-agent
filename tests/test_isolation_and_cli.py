@@ -166,6 +166,25 @@ class CliTests(unittest.TestCase):
         self.assertIn("42", text)
         self.assertNotIn("too deeply to print", text)
 
+    def test_deep_list_at_root_of_anthropic_input_keeps_both_records(self) -> None:
+        deep: object = 1
+        for _ in range(600):
+            deep = [deep]
+        env = {**environment("openai"), **environment("anthropic")}
+
+        def post(url, headers, body):
+            return openai_reply('{"base":3,"height":5}') if "openai" in url else anthropic_reply(deep)
+
+        out = io.StringIO()
+        with mock.patch.dict("os.environ", env, clear=True), \
+                mock.patch.object(cli, "post_json", post), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = cli.main([])
+        records = [json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertEqual([r["provider"] for r in records], ["openai", "anthropic"])
+        self.assertEqual(records[1]["outcome"], "fail")
+        self.assertEqual(code, 1)
+
     def test_provider_flag_limits_the_run(self) -> None:
         out = io.StringIO()
         with mock.patch.dict("os.environ", {}, clear=True), contextlib.redirect_stdout(out), \
