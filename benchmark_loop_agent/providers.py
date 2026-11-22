@@ -107,7 +107,9 @@ def request_openai(api_key: str, model: str, case: PinnedCase, post: PostJson) -
             raw_arguments = tool_call["function"]["arguments"]
             try:
                 arguments = json.loads(raw_arguments)
-            except (json.JSONDecodeError, TypeError):
+            except (ValueError, RecursionError, TypeError):
+                # ValueError covers JSONDecodeError and also Python's integer-digit
+                # limit; RecursionError covers absurdly deep nesting.
                 malformed.append(f"arguments for {name} are not valid JSON")
                 unscorable.append({name: raw_arguments})
                 continue

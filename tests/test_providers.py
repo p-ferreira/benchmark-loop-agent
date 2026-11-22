@@ -83,6 +83,14 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(record.outcome, "fail")
         self.assertEqual(record.returned_calls, [{NAME: "{bad"}])
 
+    def test_openai_undecodable_arguments_fail_and_keep_metadata(self) -> None:
+        for raw in ('{"base": ' + "9" * 4301 + ', "height": 5}', "[" * 100000):
+            with self.subTest(raw=raw[:10]):
+                record, _ = self.run_case("openai", openai_reply(raw))
+                self.assertEqual(record.outcome, "fail")
+                self.assertEqual(record.actual_model, "gpt-actual")
+                self.assertEqual(record.returned_calls, [{NAME: raw}])
+
     def test_anthropic_non_object_input_fails_and_keeps_the_call(self) -> None:
         reply = anthropic_reply({})
         reply["content"][0]["input"] = "oops"
