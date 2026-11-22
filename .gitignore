@@ -1,0 +1,13 @@
+# Python environments and caches
+.venv/
+.lab/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local credential files (keys are read from the environment at run time)
+.env
+.env.*
+*.key

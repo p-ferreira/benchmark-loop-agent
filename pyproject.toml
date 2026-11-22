@@ -1,0 +1,8 @@
+[project]
+name = "benchmark-loop-agent"
+version = "0.1.0"
+description = "Runs one pinned BFCL function-calling case through OpenAI and Anthropic and scores it with BFCL's AST checker."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = []
