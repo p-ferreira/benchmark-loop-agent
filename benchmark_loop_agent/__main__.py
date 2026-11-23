@@ -7,7 +7,7 @@ import sys
 from typing import Sequence
 
 from .case import load_case
-from .providers import post_json
+from .providers import send_request
 from .record import Record
 from .runner import PROVIDERS, run_providers
 
@@ -39,7 +39,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     names = [args.provider] if args.provider else list(PROVIDERS)
-    records = run_providers(names, load_case(), os.environ, post_json)
+    records = run_providers(names, load_case(), os.environ, send_request)
     for record in records:
         print(json.dumps(record.to_dict()))  # one record per line (JSON Lines)
         print(f"{record.provider}: {record.outcome}", file=sys.stderr)

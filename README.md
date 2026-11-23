@@ -8,8 +8,8 @@ call is only compared with the expected answer. It is never executed.
 
 ## Install
 
-Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/). The project has no
-runtime dependencies (HTTP uses the standard library).
+Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/). Requests are
+made with the official `openai` and `anthropic` Python libraries.
 
 ```sh
 uv sync --locked

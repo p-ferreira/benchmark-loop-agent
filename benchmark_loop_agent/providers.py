@@ -4,22 +4,24 @@ Each adapter sends the case prompt and function schema in that provider's own
 format and returns the tool calls it got back in the form BFCL's scorer
 expects. Nothing here executes a returned call.
 
-The HTTP boundary is a plain function (``PostJson``) so tests can replace it;
-the standard library is enough, so the project has no runtime dependencies.
+Requests go through each provider's official Python library, which owns the
+endpoint, the authentication headers and the API version. The call into the
+library is a plain function (``Send``) so tests can replace it.
 """
 
 import json
-import urllib.error
-import urllib.request
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+import anthropic
+import openai
+
 from .case import PinnedCase
 from .scoring import BfclCall
 
-# (url, headers, JSON body) -> parsed JSON response. Raises ProviderError on failure.
-PostJson = Callable[[str, dict[str, str], dict[str, Any]], dict[str, Any]]
+# (provider name, API key, request arguments) -> the reply as a plain dict.
+Send = Callable[[str, str, dict[str, Any]], dict[str, Any]]
 
 REQUEST_TIMEOUT_SECONDS = 120
 ANTHROPIC_MAX_TOKENS = 1024  # required by the Messages API; ample for one tool call
@@ -69,23 +71,23 @@ class ProviderResponse:
     unscorable_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
-def post_json(url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
-    """POST ``body`` as JSON using the standard library and parse the JSON reply."""
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode(),
-        headers={"content-type": "application/json", **headers},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-            return json.loads(response.read())
-    except urllib.error.HTTPError as error:
-        # Not truncated here: the runner redacts keys, then truncates, so a key
-        # can never be cut in half and slip past redaction.
-        raise ProviderError(f"HTTP {error.code}: {error.read().decode(errors='replace')}") from None
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-        raise ProviderError(f"{type(error).__name__}: {error}") from None
+def send_request(
+    provider: str, api_key: str, request: dict[str, Any], http_client: Any = None
+) -> dict[str, Any]:
+    """Send ``request`` with the provider's official library and return the reply as a dict.
+
+    A failed call raises the library's own exception. The runner turns any
+    exception into an "unscored" record and redacts keys from its text.
+    ``http_client`` (the libraries' own HTTP client type) lets the tests answer
+    the request without a network.
+    """
+    if provider == "openai":
+        client = openai.OpenAI(api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, http_client=http_client)
+        return client.responses.create(**request).to_dict()
+    if provider == "anthropic":
+        client = anthropic.Anthropic(api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, http_client=http_client)
+        return client.messages.create(**request).to_dict()
+    raise ProviderError(f"unknown provider: {provider}")
 
 
 def json_schema_parameters(bfcl_parameters: dict[str, Any]) -> dict[str, Any]:
@@ -101,7 +103,7 @@ def json_schema_parameters(bfcl_parameters: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
-def request_openai(api_key: str, model: str, case: PinnedCase, post: PostJson) -> ProviderResponse:
+def request_openai(api_key: str, model: str, case: PinnedCase, send: Send) -> ProviderResponse:
     """Call the OpenAI Responses API with the case's function as a tool."""
     # The Responses API is used because OpenAI's current reasoning models refuse
     # function tools on the older Chat Completions endpoint. Its tools are flat
@@ -119,13 +121,13 @@ def request_openai(api_key: str, model: str, case: PinnedCase, post: PostJson) -
         }
         for f in case.functions
     ]
-    body = {
+    request = {
         "model": model,
         "input": [{"role": "user", "content": case.prompt}],
         "tools": tools,
         "store": False,  # a benchmark request has no reason to be kept by the provider
     }
-    reply = post("https://api.openai.com/v1/responses", {"authorization": f"Bearer {api_key}"}, body)
+    reply = send("openai", api_key, request)
 
     try:
         usage = reply.get("usage") or {}
@@ -164,10 +166,9 @@ def request_openai(api_key: str, model: str, case: PinnedCase, post: PostJson) -
         raise ProviderError(f"unexpected OpenAI response shape: {type(error).__name__}: {error}") from None
 
 
-def request_anthropic(api_key: str, model: str, case: PinnedCase, post: PostJson) -> ProviderResponse:
+def request_anthropic(api_key: str, model: str, case: PinnedCase, send: Send) -> ProviderResponse:
     """Call Anthropic Messages with the case's function as a tool."""
-    # Anthropic tools are flat, name the schema "input_schema", and require
-    # max_tokens. The API key goes in "x-api-key", not a Bearer header.
+    # Anthropic tools are flat, name the schema "input_schema", and require max_tokens.
     tools = [
         {
             "name": f["name"],
@@ -176,14 +177,13 @@ def request_anthropic(api_key: str, model: str, case: PinnedCase, post: PostJson
         }
         for f in case.functions
     ]
-    body = {
+    request = {
         "model": model,
         "max_tokens": ANTHROPIC_MAX_TOKENS,
         "messages": [{"role": "user", "content": case.prompt}],
         "tools": tools,
     }
-    headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
-    reply = post("https://api.anthropic.com/v1/messages", headers, body)
+    reply = send("anthropic", api_key, request)
 
     try:
         usage = reply.get("usage") or {}

@@ -1,11 +1,13 @@
-"""Offline tests: both adapters through pass, fail and error paths, with the HTTP boundary replaced."""
+"""Offline tests: both adapters through pass, fail and error paths, with the provider call replaced."""
 
 import json
 import unittest
 from typing import Any
 
+import httpx2
+
 from benchmark_loop_agent.case import load_case
-from benchmark_loop_agent.providers import ProviderError
+from benchmark_loop_agent.providers import ProviderError, request_anthropic, request_openai, send_request
 from benchmark_loop_agent.runner import run_provider
 
 SECRET = "sk-test-SECRET-123"
@@ -38,14 +40,14 @@ def environment(provider: str) -> dict[str, str]:
 
 
 class FakePost:
-    """Stands in for the HTTP boundary and remembers what was sent."""
+    """Stands in for the call into the provider's library and remembers what was sent."""
 
     def __init__(self, reply: dict[str, Any] | Exception) -> None:
         self.reply = reply
-        self.requests: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+        self.requests: list[tuple[str, str, dict[str, Any]]] = []
 
-    def __call__(self, url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
-        self.requests.append((url, headers, body))
+    def __call__(self, provider: str, api_key: str, request: dict[str, Any]) -> dict[str, Any]:
+        self.requests.append((provider, api_key, request))
         if isinstance(self.reply, Exception):
             raise self.reply
         return self.reply
@@ -62,9 +64,8 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(record.returned_calls, [{NAME: RIGHT}])
         self.assertEqual((record.requested_model, record.actual_model), ("requested-model", "gpt-actual"))
         self.assertEqual((record.input_tokens, record.output_tokens), (7, 3))
-        url, headers, body = post.requests[0]
-        self.assertEqual(url, "https://api.openai.com/v1/responses")
-        self.assertEqual(headers["authorization"], f"Bearer {SECRET}")
+        provider, api_key, body = post.requests[0]
+        self.assertEqual((provider, api_key), ("openai", SECRET))
         tool = body["tools"][0]
         self.assertEqual((tool["type"], tool["name"], tool["parameters"]["type"]), ("function", NAME, "object"))
         # Optional BFCL parameters stay optional: strict mode would reject the schema.
@@ -123,9 +124,8 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(record.outcome, "pass")
         self.assertEqual(record.actual_model, "claude-actual")
         self.assertEqual((record.input_tokens, record.output_tokens), (8, 4))
-        url, headers, body = post.requests[0]
-        self.assertIn("anthropic.com", url)
-        self.assertEqual(headers["x-api-key"], SECRET)
+        provider, api_key, body = post.requests[0]
+        self.assertEqual((provider, api_key), ("anthropic", SECRET))
         self.assertEqual(body["tools"][0]["input_schema"]["type"], "object")
 
     def test_anthropic_fail_wrong_value(self) -> None:
@@ -179,19 +179,64 @@ class AdapterTests(unittest.TestCase):
                 for n in range(4, len(SECRET) + 1):
                     self.assertNotIn(SECRET[:n], reason)
 
-    def test_long_http_error_body_is_not_truncated_before_redaction(self) -> None:
-        import io
-        import urllib.error
-        from unittest import mock
 
-        from benchmark_loop_agent.providers import post_json
+class OfficialLibraryTests(unittest.TestCase):
+    """The real ``send_request``, with the libraries' HTTP client answered locally."""
 
-        body = ("y" * 495 + SECRET).encode()
-        error = urllib.error.HTTPError("https://example.invalid", 401, "x", {}, io.BytesIO(body))
-        with mock.patch("urllib.request.urlopen", side_effect=error):
-            with self.assertRaises(ProviderError) as caught:
-                post_json("https://example.invalid", {}, {})
-        self.assertIn(SECRET, str(caught.exception))
+    def send_through_library(self, provider: str, status: int, reply: Any):
+        seen: list[httpx2.Request] = []
+
+        def answer(request: httpx2.Request) -> httpx2.Response:
+            seen.append(request)
+            return httpx2.Response(status, json=reply)
+
+        client = httpx2.Client(transport=httpx2.MockTransport(answer))
+
+        def send(name: str, api_key: str, request: dict[str, Any]) -> dict[str, Any]:
+            return send_request(name, api_key, request, http_client=client)
+
+        adapter = {"openai": request_openai, "anthropic": request_anthropic}[provider]
+        return adapter, send, seen
+
+    def test_openai_library_posts_to_responses_and_its_reply_is_understood(self) -> None:
+        wire = {
+            "id": "resp_1", "object": "response", "model": "gpt-actual", "status": "completed",
+            "output": [{"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": NAME,
+                        "arguments": json.dumps(RIGHT), "status": "completed"}],
+            "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+        }
+        adapter, send, seen = self.send_through_library("openai", 200, wire)
+        response = adapter(SECRET, "requested-model", load_case(), send)
+        self.assertEqual(response.calls, [{NAME: RIGHT}])
+        self.assertEqual((response.actual_model, response.input_tokens, response.output_tokens), ("gpt-actual", 7, 3))
+        self.assertEqual(seen[0].url.path, "/v1/responses")
+        self.assertEqual(seen[0].headers["authorization"], f"Bearer {SECRET}")
+        sent = json.loads(seen[0].content)
+        self.assertEqual((sent["model"], sent["store"], sent["tools"][0]["name"]), ("requested-model", False, NAME))
+
+    def test_anthropic_library_posts_to_messages_and_its_reply_is_understood(self) -> None:
+        wire = {
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-actual",
+            "content": [{"type": "tool_use", "id": "toolu_1", "name": NAME, "input": RIGHT}],
+            "stop_reason": "tool_use", "usage": {"input_tokens": 8, "output_tokens": 4},
+        }
+        adapter, send, seen = self.send_through_library("anthropic", 200, wire)
+        response = adapter(SECRET, "requested-model", load_case(), send)
+        self.assertEqual(response.calls, [{NAME: RIGHT}])
+        self.assertEqual((response.actual_model, response.input_tokens, response.output_tokens), ("claude-actual", 8, 4))
+        self.assertEqual(seen[0].url.path, "/v1/messages")
+        # Which header carries the key is the library's business; it must be sent.
+        self.assertIn(SECRET, " ".join(seen[0].headers.values()))
+        sent = json.loads(seen[0].content)
+        self.assertEqual((sent["model"], sent["tools"][0]["input_schema"]["type"]), ("requested-model", "object"))
+
+    def test_a_refused_request_raises_with_the_provider_message(self) -> None:
+        for provider in ("openai", "anthropic"):
+            with self.subTest(provider=provider):
+                adapter, send, _ = self.send_through_library(provider, 401, {"error": {"message": "bad key here"}})
+                with self.assertRaises(Exception) as caught:
+                    adapter(SECRET, "requested-model", load_case(), send)
+                self.assertIn("bad key here", str(caught.exception))
 
 
 if __name__ == "__main__":

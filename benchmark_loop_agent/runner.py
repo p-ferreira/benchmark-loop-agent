@@ -9,7 +9,7 @@ from dataclasses import dataclass, fields
 from typing import Any, Callable, Mapping, Sequence
 
 from .case import DATASET_REVISION, PinnedCase, load_expected_answer
-from .providers import PostJson, ProviderError, ProviderResponse, request_anthropic, request_openai
+from .providers import ProviderError, ProviderResponse, Send, request_anthropic, request_openai
 from .record import Record
 from .scoring import SCORER_REVISION, score_calls
 
@@ -22,7 +22,7 @@ class Provider:
 
     key_env: str
     model_env: str
-    request: Callable[[str, str, PinnedCase, PostJson], ProviderResponse]
+    request: Callable[[str, str, PinnedCase, Send], ProviderResponse]
 
 
 PROVIDERS: dict[str, Provider] = {
@@ -54,7 +54,7 @@ def redact_record(record: Record, secrets: Sequence[str]) -> Record:
 
 
 def run_provider(
-    name: str, case: PinnedCase, environment: Mapping[str, str], post: PostJson
+    name: str, case: PinnedCase, environment: Mapping[str, str], send: Send
 ) -> Record:
     """Run the case against one provider and return its record. Never raises."""
     provider = PROVIDERS[name]
@@ -87,7 +87,7 @@ def run_provider(
 
     started = time.perf_counter()
     try:
-        response = provider.request(api_key, model, case, post)
+        response = provider.request(api_key, model, case, send)
     except Exception as error:  # any failure of the call is "unscored", never a crash
         return record("unscored", [f"{type(error).__name__}: {error}"], latency=time.perf_counter() - started)
     latency = time.perf_counter() - started
@@ -113,7 +113,7 @@ def run_provider(
 
 
 def run_providers(
-    names: Sequence[str], case: PinnedCase, environment: Mapping[str, str], post: PostJson
+    names: Sequence[str], case: PinnedCase, environment: Mapping[str, str], send: Send
 ) -> list[Record]:
     """Run the case once per named provider, in order."""
-    return [run_provider(name, case, environment, post) for name in names]
+    return [run_provider(name, case, environment, send) for name in names]

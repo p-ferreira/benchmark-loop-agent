@@ -56,8 +56,8 @@ class ProviderIsolationTests(unittest.TestCase):
     def test_one_failing_provider_does_not_alter_the_other(self) -> None:
         env = {**environment("openai"), **environment("anthropic")}
 
-        def post(url, headers, body):
-            if "openai" in url:
+        def post(provider, api_key, request):
+            if provider == "openai":
                 raise RuntimeError(SECRET)
             return anthropic_reply(RIGHT)
 
@@ -70,8 +70,8 @@ class ProviderIsolationTests(unittest.TestCase):
     def test_non_object_arguments_from_one_provider_do_not_stop_the_other(self) -> None:
         env = {**environment("openai"), **environment("anthropic")}
 
-        def post(url, headers, body):
-            return openai_reply("null") if "openai" in url else anthropic_reply(RIGHT)
+        def post(provider, api_key, request):
+            return openai_reply("null") if provider == "openai" else anthropic_reply(RIGHT)
 
         records = run_providers(["openai", "anthropic"], load_case(), env, post)
         self.assertEqual([r.outcome for r in records], ["fail", "pass"])
@@ -104,7 +104,7 @@ class CliTests(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         env = {**environment("openai"), **environment("anthropic")}
         with mock.patch.dict("os.environ", env, clear=True), \
-                mock.patch.object(cli, "post_json", FakePost(RuntimeError(f"key {SECRET}"))), \
+                mock.patch.object(cli, "send_request", FakePost(RuntimeError(f"key {SECRET}"))), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = cli.main([])
         lines = out.getvalue().splitlines()
@@ -122,7 +122,7 @@ class CliTests(unittest.TestCase):
             with self.subTest(provider=provider):
                 out = io.StringIO()
                 with mock.patch.dict("os.environ", environment(provider), clear=True), \
-                        mock.patch.object(cli, "post_json", FakePost(reply)), \
+                        mock.patch.object(cli, "send_request", FakePost(reply)), \
                         contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
                     code = cli.main(["--provider", provider])
                 data = json.loads(out.getvalue(), parse_constant=reject_constant)
@@ -136,13 +136,13 @@ class CliTests(unittest.TestCase):
         for _ in range(992):
             deep = [deep]
 
-        def post(url, headers, body):
-            return openai_reply(raw) if "openai" in url else anthropic_reply({"base": deep, "height": 5})
+        def post(provider, api_key, request):
+            return openai_reply(raw) if provider == "openai" else anthropic_reply({"base": deep, "height": 5})
 
         out = io.StringIO()
         env = {**environment("openai"), **environment("anthropic")}
         with mock.patch.dict("os.environ", env, clear=True), \
-                mock.patch.object(cli, "post_json", post), \
+                mock.patch.object(cli, "send_request", post), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             code = cli.main([])
         records = [json.loads(line) for line in out.getvalue().splitlines()]
@@ -156,7 +156,7 @@ class CliTests(unittest.TestCase):
             deep = {"child": deep}
         out = io.StringIO()
         with mock.patch.dict("os.environ", environment("anthropic"), clear=True), \
-                mock.patch.object(cli, "post_json", FakePost(anthropic_reply(deep))), \
+                mock.patch.object(cli, "send_request", FakePost(anthropic_reply(deep))), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             cli.main(["--provider", "anthropic"])
         record = json.loads(out.getvalue())
@@ -172,12 +172,12 @@ class CliTests(unittest.TestCase):
             deep = [deep]
         env = {**environment("openai"), **environment("anthropic")}
 
-        def post(url, headers, body):
-            return openai_reply('{"base":3,"height":5}') if "openai" in url else anthropic_reply(deep)
+        def post(provider, api_key, request):
+            return openai_reply('{"base":3,"height":5}') if provider == "openai" else anthropic_reply(deep)
 
         out = io.StringIO()
         with mock.patch.dict("os.environ", env, clear=True), \
-                mock.patch.object(cli, "post_json", post), \
+                mock.patch.object(cli, "send_request", post), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             code = cli.main([])
         records = [json.loads(line) for line in out.getvalue().splitlines()]
