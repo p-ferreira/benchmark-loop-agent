@@ -19,6 +19,7 @@ class Receiver:
 
     def __init__(self, status: int = 200) -> None:
         self.status = status
+        self.reason: str | None = None  # the HTTP reason phrase of a failure
         self.spans: list[dict[str, Any]] = []
         self.paths: list[str] = []
         self.headers: list[dict[str, str]] = []
@@ -43,7 +44,7 @@ class Receiver:
                                     "attributes": {a.key: _value(a.value) for a in span.attributes},
                                     "resource": resource_attributes,
                                 })
-                self.send_response(receiver.status)
+                self.send_response(receiver.status, receiver.reason)
                 self.end_headers()
 
             def log_message(self, *args: Any) -> None:

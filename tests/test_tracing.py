@@ -1,6 +1,8 @@
 """Offline tests of tracing: off by default, on against a local stand-in receiver, failures contained."""
 
 import json
+import contextlib
+import io
 import logging
 import tempfile
 import unittest
@@ -8,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import httpx2
+import requests
 
 from benchmark_loop_agent import tracing
 from benchmark_loop_agent.batch import RunParameters, run_batch
@@ -69,6 +72,13 @@ class OffByDefault(TracingTestCase):
         self.assertEqual(self.receiver.spans, [])
         self.assertEqual(self.receiver.paths, [])
         self.assertEqual(len(records), 2)
+
+    def test_the_expected_size_of_each_category_is_saved(self) -> None:
+        self.run_batch(FakeSend(wrong), environment("openai"), sample_size=0)
+        self.assertEqual(read_manifest(self.directory)["selection"], {"simple_python": 0})
+        other = Path(tempfile.mkdtemp()) / "other"
+        self.run_batch(FakeSend(wrong), environment("openai"), directory=other)
+        self.assertEqual(read_manifest(other)["selection"], {"simple_python": 2})
 
     def test_blank_endpoint_is_off(self) -> None:
         self.assertIsNone(tracing.configure({"PHOENIX_COLLECTOR_ENDPOINT": "  "}, "run"))
@@ -162,6 +172,37 @@ class TracingOn(TracingTestCase):
         self.assertNotIn(PHOENIX_KEY, record.getMessage())
 
 
+class Redaction(TracingTestCase):
+    def test_an_exporter_error_does_not_print_the_phoenix_key(self) -> None:
+        self.receiver.status, self.receiver.reason = 401, f"bad key {PHOENIX_KEY}"
+        stderr, captured = io.StringIO(), io.StringIO()
+        handler = logging.StreamHandler(captured)
+        logging.getLogger().addHandler(handler)
+        self.addCleanup(logging.getLogger().removeHandler, handler)
+        with contextlib.redirect_stderr(stderr), mock.patch.object(tracing, "FLUSH_TIMEOUT_MILLIS", 3000):
+            self.run_batch(FakeSend(wrong), self.env(PHOENIX_API_KEY=PHOENIX_KEY), sample_size=1)
+        self.assertTrue(self.receiver.headers, "the exporter never reached the receiver")
+        self.assertNotIn(PHOENIX_KEY, stderr.getvalue() + captured.getvalue())
+        self.assertIn("[redacted]", stderr.getvalue() + captured.getvalue())
+        self.assertIs(logging.getLogRecordFactory(), logging.LogRecord)  # restored on shutdown
+
+    def test_instrumented_responses_and_the_project_name_are_scrubbed_before_export(self) -> None:
+        leaking = {**WIRE, "model": f"model-{PHOENIX_KEY}-{SECRET}"}
+
+        def answer(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=leaking)
+
+        client = httpx2.Client(transport=httpx2.MockTransport(answer))
+        send = lambda name, key, request: send_request(name, key, request, http_client=client)  # noqa: E731
+        env = self.env(PHOENIX_API_KEY=PHOENIX_KEY, PHOENIX_PROJECT_NAME=f"project-{PHOENIX_KEY}")
+        self.run_batch(send, env, sample_size=1)
+        self.assertTrue([s for s in self.receiver.spans if s["name"] != "benchmark_case"])
+        sent = json.dumps(self.receiver.spans)
+        for secret in (PHOENIX_KEY, SECRET):
+            self.assertNotIn(secret, sent)
+        self.assertIn("[redacted]", sent)
+
+
 class ExportFailures(TracingTestCase):
     def baseline(self, send):
         plain = Path(tempfile.mkdtemp()) / "plain"
@@ -180,11 +221,9 @@ class ExportFailures(TracingTestCase):
         self.check_unchanged(self.env())
 
     def test_a_receiver_that_is_not_there(self) -> None:
-        self.receiver.close()
-        from tests.support import ALLOWED_LOCAL_PORTS
-        ALLOWED_LOCAL_PORTS.add(self.receiver.port)  # connection refused, not a refused test
-        self.addCleanup(ALLOWED_LOCAL_PORTS.discard, self.receiver.port)
-        self.check_unchanged(self.env())
+        # Refuse the connection at the transport: the test never touches a port it does not own.
+        with mock.patch("requests.adapters.HTTPAdapter.send", side_effect=requests.ConnectionError("refused")):
+            self.check_unchanged(self.env())
 
     def test_an_exception_inside_the_span_code_changes_nothing(self) -> None:
         expected, _ = self.baseline(FakeSend(wrong))

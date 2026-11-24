@@ -203,7 +203,7 @@ uv run --locked python -m benchmark_loop_agent --output-dir runs/small --sample-
 | Setting | Meaning |
 |---------|---------|
 | `PHOENIX_COLLECTOR_ENDPOINT` | base address of Phoenix; the code appends the OTLP path `/v1/traces`. **Unset: nothing is sent and the run behaves as before** |
-| `PHOENIX_API_KEY` | only for a Phoenix that requires one; sent as a bearer token. Treated like the provider keys: never in a record, log, error message or trace |
+| `PHOENIX_API_KEY` | only for a Phoenix that requires one; sent as a bearer token. Treated like the provider keys: never in a record, log (exporter errors included), error message or trace; every span is scrubbed before export |
 | `PHOENIX_PROJECT_NAME` | Phoenix project the traces go to (default `benchmark-loop-agent`) |
 
 Each `benchmark_case` span carries `benchmark.run_id` (also in `run.json`, and
@@ -262,8 +262,10 @@ directory unless `--output-dir` says otherwise. A report holds:
 * the requested and actual model, dataset and scorer revisions, and the run's
   parameters;
 * a note at the top if the run was sampled (`--sample-size`) or is incomplete
-  (unscored cases, a category without records, or a last invocation that never
-  ended).
+  (unscored cases, a category with fewer records than the run selected for it
+  (the selection size is saved in `run.json`), or a last invocation that never
+  ended). A record with only one token count still contributes that count; cases
+  missing either are all named, with the missing one.
 
 ## Tests
 

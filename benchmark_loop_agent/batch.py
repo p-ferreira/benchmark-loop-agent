@@ -2,6 +2,7 @@
 
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -76,7 +77,9 @@ def run_batch(
     run_id = (previous or {}).get("run_id") or uuid.uuid4().hex
     tracing = tracing_for(run_id) if tracing_for else None
     session: dict[str, Any] = {"number": number, "concurrency": parameters.concurrency, "started_at": now(), "ended_at": None, "wall_seconds": None}
-    write_manifest(directory, parameters.identity(), session, run_id)
+    selection = dict(Counter(case.category for case in cases))
+    selection = {category: selection.get(category, 0) for category in parameters.categories}
+    write_manifest(directory, parameters.identity(), session, run_id, selection)
     started = time.perf_counter()
     retrying = with_retries(send, sleep=sleep)
 

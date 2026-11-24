@@ -29,12 +29,19 @@ RECORDS = [
 ]
 
 
-def manifest(sessions, sample_size=None, categories=("simple_python", "irrelevance")):
-    return {"run_id": "run123", "dataset_revision": "dsrev", "scorer_revision": "screv",
+def manifest(sessions, sample_size=None, categories=("simple_python", "irrelevance"), selection="default", concurrency=None):
+    if selection == "default":
+        selection = {"simple_python": 2, "irrelevance": 3}
+    m = {"run_id": "run123", "dataset_revision": "dsrev", "scorer_revision": "screv",
             "parameters": {"categories": list(categories), "sample_size": sample_size, "seed": 4,
                            "providers": ["openai", "anthropic"],
                            "models": {"openai": "gpt-known", "anthropic": "claude-unpriced"}},
             "sessions": sessions}
+    if selection is not None:
+        m["selection"] = selection
+    if concurrency is not None:
+        m["parameters"]["concurrency"] = concurrency
+    return m
 
 
 DONE = {"number": 1, "concurrency": 3, "started_at": "T0", "ended_at": "T1", "wall_seconds": 42.5}
@@ -56,15 +63,47 @@ class ReportTests(unittest.TestCase):
         # (6000 * 2 + 600 * 10) / 1e6
         self.assertIn("**$0.0180**", text)
         self.assertIn("uncached input rate", text)
-        self.assertIn("2 case(s) have no reported usage", text)
-        self.assertIn("`b2`", text)
-        self.assertIn("`b3`", text)
+        self.assertIn("2 case(s) lack reported usage", text)
+        self.assertIn("`b2` (input and output)", text)
+        self.assertIn("`b3` (input and output)", text)
         self.assertIn("Wall time: 42.5 s over 1 invocation(s)", text)
         self.assertIn("| 1 | 3 | T0 | T1 | 42.5 s |", text)
         for item in ("`gpt-known`", "`gpt-known-2026`", "`dsrev`", "`screv`", "run123", "Seed: 4"):
             self.assertIn(item, text)
         self.assertIn("pricing page", text)
         self.assertNotIn("Sampled run", text)
+
+    def test_partial_usage_keeps_the_known_component(self) -> None:
+        records = [record("openai", "p1", "simple_python", "pass", (1000, None)),
+                   record("openai", "p2", "simple_python", "pass", (None, 50))]
+        text = report.render(manifest([DONE], selection={"simple_python": 2, "irrelevance": 0}), "openai", records, RATES)
+        self.assertIn("Input tokens: 1,000", text)
+        self.assertIn("Output tokens: 50", text)
+        self.assertIn("**$0.0025**", text)  # (1000 * 2 + 50 * 10) / 1e6
+        self.assertIn("`p1` (output)", text)
+        self.assertIn("`p2` (input)", text)
+        self.assertIn("Records with complete usage: 0 of 2", text)
+
+    def test_every_case_without_usage_is_named(self) -> None:
+        records = [record("openai", f"n{i:02}", "simple_python", "pass", None) for i in range(21)]
+        text = report.render(manifest([DONE], selection={"simple_python": 21, "irrelevance": 0}), "openai", records, RATES)
+        self.assertIn("21 case(s) lack reported usage", text)
+        self.assertIn("`n20`", text)
+        self.assertNotIn("more", text.split("lack reported usage")[1].split("\n")[0])
+
+    def test_a_partial_category_is_incomplete_even_with_an_end_time(self) -> None:
+        records = [record("openai", "a1", "simple_python", "pass")]
+        text = report.render(manifest([DONE], selection={"simple_python": 2, "irrelevance": 0}), "openai", records, RATES)
+        self.assertIn("**Incomplete run.** records missing for `simple_python` (1 of 2 case(s))", text)
+
+    def test_an_empty_selection_is_complete(self) -> None:
+        text = report.render(manifest([DONE], selection={"simple_python": 0, "irrelevance": 0}), "openai", [], RATES)
+        self.assertNotIn("Incomplete run", text)
+
+    def test_the_earlier_manifest_keeps_its_concurrency(self) -> None:
+        old = {k: v for k, v in DONE.items() if k != "concurrency"}
+        text = report.render(manifest([old], concurrency=7), "openai", RECORDS, RATES)
+        self.assertIn("| 1 | 7 | T0 | T1 | 42.5 s |", text)
 
     def test_unscored_makes_the_run_incomplete(self) -> None:
         self.assertIn("**Incomplete run.** 1 case(s) are unscored", self.render())
@@ -73,7 +112,7 @@ class ReportTests(unittest.TestCase):
         text = self.render("anthropic")
         self.assertIn("Cost: not given, the rates file has no entry for `claude-unpriced`", text)
         self.assertNotIn("$", text)
-        self.assertIn("no record for `irrelevance`", text)  # also incomplete
+        self.assertIn("`irrelevance` (0 of 3 case(s))", text)  # also incomplete
 
     def test_an_interrupted_invocation_has_no_wall_time(self) -> None:
         text = self.render(sessions=(DONE, CUT))
@@ -89,7 +128,7 @@ class ReportTests(unittest.TestCase):
 
     def test_a_complete_full_run_has_no_warning(self) -> None:
         records = [r for r in RECORDS if r["outcome"] != "unscored"]
-        text = self.render(records=records)
+        text = self.render(records=records, selection={"simple_python": 2, "irrelevance": 2})
         self.assertNotIn("Incomplete run", text)
         self.assertNotIn("Sampled run", text)
 
