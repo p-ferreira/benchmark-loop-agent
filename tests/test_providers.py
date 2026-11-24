@@ -62,6 +62,18 @@ class AdapterTests(unittest.TestCase):
                 self.assertEqual(record.actual_model, "gpt-actual")
                 self.assertEqual(record.returned_calls, [{NAME: raw}])
 
+    def test_deep_arguments_are_a_call_for_relevance_and_unscorable_for_ast(self) -> None:
+        deep: dict[str, Any] = {}
+        for _ in range(50):
+            deep = {"a": deep}
+        replies = {"openai": openai_reply([{NAME: json.dumps(deep)}], raw=True),
+                   "anthropic": anthropic_reply([{NAME: deep}])}
+        for provider, reply in replies.items():
+            with self.subTest(provider=provider):
+                self.assertEqual(run(provider, reply, case_by_id("live_relevance"))[0].outcome, "pass")
+                self.assertEqual(run(provider, reply, case_by_id("irrelevance"))[0].outcome, "fail")
+                self.assertEqual(run(provider, reply)[0].outcome, "fail")
+
     def test_non_object_anthropic_input_fails_and_is_kept(self) -> None:
         record, _ = run("anthropic", anthropic_reply([{NAME: "oops"}]))
         self.assertEqual((record.outcome, record.returned_calls), ("fail", [{NAME: "oops"}]))

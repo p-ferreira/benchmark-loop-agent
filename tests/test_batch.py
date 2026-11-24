@@ -191,6 +191,29 @@ class BatchTests(unittest.TestCase):
             self.assertEqual(after[key], "fail")  # finished records were not touched
         self.assertNotIn("unscored", after.values())
 
+    def test_each_session_keeps_its_own_concurrency(self) -> None:
+        self.run_batch(FakeSend(perfect), concurrency=1, sample_size=1)
+        self.run_batch(FakeSend(perfect), concurrency=8, sample_size=1)
+        manifest = json.loads((self.directory / "run.json").read_text())
+        self.assertEqual([s["concurrency"] for s in manifest["sessions"]], [1, 8])
+        self.assertNotIn("concurrency", manifest["parameters"])
+
+    def test_a_model_id_containing_a_key_is_refused_before_anything_is_written(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            self.run_batch(FakeSend(perfect), models={"openai": SECRET, "anthropic": "requested-model"})
+        self.assertNotIn(SECRET, str(caught.exception))
+        self.assertFalse((self.directory / "run.json").exists())
+
+    def test_unreadable_expected_answers_leave_the_case_unscored(self) -> None:
+        with mock.patch("benchmark_loop_agent.scoring.load_expected_answers", side_effect=OSError("denied")):
+            self.run_batch(FakeSend(perfect), categories=("simple_python",), sample_size=1, providers=("openai",))
+        (row,) = self.records()
+        self.assertEqual(row["outcome"], "unscored")
+        again = FakeSend(perfect)
+        self.run_batch(again, categories=("simple_python",), sample_size=1, providers=("openai",))
+        self.assertEqual(len(again.requests), 1)
+        self.assertEqual(self.records()[0]["outcome"], "pass")
+
     def test_a_case_that_keeps_failing_is_unscored_after_bounded_attempts(self) -> None:
         send = FakeSend(lambda provider, request: Transient(f"busy {SECRET}"))
         self.run_batch(send, categories=("simple_python",), sample_size=1, providers=("openai",))
@@ -281,7 +304,8 @@ class CliTests(unittest.TestCase):
         manifest = json.loads((Path(directory) / "run.json").read_text())
         self.assertEqual(manifest["parameters"], {
             "categories": ["simple_python", "irrelevance"], "sample_size": 2, "seed": 4,
-            "providers": ["anthropic"], "models": {"anthropic": "claude-x"}, "concurrency": 3})
+            "providers": ["anthropic"], "models": {"anthropic": "claude-x"}})
+        self.assertEqual(manifest["sessions"][0]["concurrency"], 3)
         rows = read_records(Path(directory) / "records.jsonl")
         self.assertEqual({(r["provider"], r["requested_model"]) for r in rows}, {("anthropic", "claude-x")})
         self.assertEqual(len(rows), 4)

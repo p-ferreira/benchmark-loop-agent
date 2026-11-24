@@ -85,6 +85,12 @@ class RelevanceScoringTests(unittest.TestCase):
         self.assertTrue(score_calls(case_by_id("irrelevance"), self.CALL, bad).passed)
         self.assertFalse(score_calls(case_by_id("live_relevance"), self.CALL, bad).passed)
 
+    def test_deeply_nested_arguments_still_count_as_a_call(self) -> None:
+        deep = ["arguments for f are nested too deeply"]
+        self.assertTrue(score_calls(case_by_id("live_relevance"), [], [], deep).passed)
+        self.assertFalse(score_calls(case_by_id("irrelevance"), [], [], deep).passed)
+        self.assertFalse(score_calls(case_by_id("simple_python"), [], [], deep).passed)
+
     def test_no_expected_answer_file_exists_for_these_categories(self) -> None:
         from benchmark_loop_agent.dataset import answer_path
 

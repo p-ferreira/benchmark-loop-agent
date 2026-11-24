@@ -85,8 +85,9 @@ checks this table against them.
 * `records.jsonl`: one JSON Lines record per case and provider, appended as
   each case finishes.
 * `run.json`: the run's parameters (categories, sample size, seed, providers,
-  model IDs, concurrency), the dataset and scorer revisions, and for every
-  invocation its number, start time, end time and wall time. A run that was
+  model IDs), the dataset and scorer revisions, and for every invocation its
+  number, concurrency, start time, end time and wall time. A model ID that
+  contains a configured API key is refused before anything is written. A run that was
   interrupted has an invocation with no end time.
 
 ### Record
@@ -111,7 +112,7 @@ One case's or one provider's failure never changes or prevents another record.
   and provider. A line cut short by an interruption is dropped.
 * Resuming with different parameters (categories, sample size, seed, providers
   or models) is refused, since the records would no longer belong to one run.
-  Concurrency may change.
+  Concurrency may change; each invocation records its own.
 * Rate limits (429), server errors (5xx), timeouts and dropped connections are
   retried with exponential backoff (1 s, 2 s, 4 s, ... up to 30 s, plus up to
   1 s of jitter), at most 5 tries in all. The libraries' own retrying is off,

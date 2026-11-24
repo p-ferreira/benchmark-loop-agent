@@ -11,7 +11,7 @@ from typing import Any, Callable, Mapping, Sequence
 from .dataset import DATASET_REVISION, Case
 from .providers import ProviderError, ProviderResponse, Send, request_anthropic, request_openai
 from .record import Record
-from .scoring import SCORER_REVISION, score_calls
+from .scoring import SCORER_REVISION, ReferenceDataError, score_calls
 
 MAX_REASON_LENGTH = 500
 
@@ -96,7 +96,11 @@ def run_provider(
     # Scoring is the only step that reads expected answers, and it runs after
     # the model has answered.
     try:
-        verdict = score_calls(case, response.calls, response.malformed)
+        verdict = score_calls(case, response.calls, response.malformed, response.too_deep)
+    except ReferenceDataError as error:
+        # Our data is unreadable, not the model wrong: unscored, so a resume retries it.
+        return record("unscored", [str(error)], calls=response.calls + response.unscorable_calls,
+                      response=response, latency=latency)
     except Exception as error:
         # The response arrived but the checker could not judge it (for example a
         # value of a type it does not expect), so it is a wrong answer, and the
