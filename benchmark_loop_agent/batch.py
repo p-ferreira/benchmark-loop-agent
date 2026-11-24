@@ -12,7 +12,7 @@ from .retry import with_retries
 from .runner import PROVIDERS, run_provider
 from .sampling import select_cases
 from .providers import Send
-from .store import RecordStore, now, read_manifest, read_records, write_manifest
+from .store import RecordStore, migrate_legacy_concurrency, now, read_manifest, read_records, write_manifest
 
 
 @dataclass(frozen=True)
@@ -51,7 +51,10 @@ def run_batch(
     previous = read_manifest(directory)
     if previous is not None:
         saved = previous["parameters"]
-        saved.pop("concurrency", None)  # manifests from before concurrency moved to the sessions
+        if "concurrency" in saved:  # earlier format: one global setting; keep it with the sessions that used it
+            migrate_legacy_concurrency(directory)
+            previous = read_manifest(directory)
+            saved = previous["parameters"]
         if saved != _jsonable(parameters.identity()):
             raise ValueError(
                 f"{directory} holds a run with different parameters; use a new --output-dir "

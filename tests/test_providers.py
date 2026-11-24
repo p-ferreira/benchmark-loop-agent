@@ -72,7 +72,9 @@ class AdapterTests(unittest.TestCase):
             with self.subTest(provider=provider):
                 self.assertEqual(run(provider, reply, case_by_id("live_relevance"))[0].outcome, "pass")
                 self.assertEqual(run(provider, reply, case_by_id("irrelevance"))[0].outcome, "fail")
-                self.assertEqual(run(provider, reply)[0].outcome, "fail")
+                graded = run(provider, reply)[0]
+                self.assertEqual(graded.outcome, "fail")
+                self.assertIn("Missing required parameter", graded.reasons[0])  # BFCL's checker graded it
 
     def test_non_object_anthropic_input_fails_and_is_kept(self) -> None:
         record, _ = run("anthropic", anthropic_reply([{NAME: "oops"}]))

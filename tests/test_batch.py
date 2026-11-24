@@ -198,6 +198,18 @@ class BatchTests(unittest.TestCase):
         self.assertEqual([s["concurrency"] for s in manifest["sessions"]], [1, 8])
         self.assertNotIn("concurrency", manifest["parameters"])
 
+    def test_earlier_manifest_format_keeps_its_global_concurrency(self) -> None:
+        self.run_batch(FakeSend(perfect), concurrency=3, sample_size=1)
+        path = self.directory / "run.json"
+        manifest = json.loads(path.read_text())
+        manifest["parameters"]["concurrency"] = 3
+        del manifest["sessions"][0]["concurrency"]
+        path.write_text(json.dumps(manifest))
+        self.run_batch(FakeSend(perfect), concurrency=6, sample_size=1)
+        manifest = json.loads(path.read_text())
+        self.assertEqual([s["concurrency"] for s in manifest["sessions"]], [3, 6])
+        self.assertNotIn("concurrency", manifest["parameters"])
+
     def test_a_model_id_containing_a_key_is_refused_before_anything_is_written(self) -> None:
         with self.assertRaises(ValueError) as caught:
             self.run_batch(FakeSend(perfect), models={"openai": SECRET, "anthropic": "requested-model"})

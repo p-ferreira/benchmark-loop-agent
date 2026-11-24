@@ -76,19 +76,20 @@ def score_relevance(category: str, made_call: bool) -> Verdict:
     return Verdict(False, ["Invalid syntax. Failed to decode AST when it should have."])
 
 
-def score_calls(case: Case, calls: list[BfclCall], malformed: list[str], too_deep: Sequence[str] = ()) -> Verdict:
+def score_calls(case: Case, calls: list[BfclCall], malformed: list[str], deep_calls: Sequence[BfclCall] = ()) -> Verdict:
     """Judge a successful response for ``case``.
 
     ``malformed`` lists the returned calls whose arguments were not a JSON
-    object. ``too_deep`` lists calls that decoded but nest beyond our safeguard:
-    they are calls for the presence rule and unscorable for the AST checker.
-    BFCL treats that as a decoding failure: a wrong answer for the AST
-    categories and "no function call" for the (ir)relevance ones.
+    object; BFCL treats that as a decoding failure: a wrong answer for the AST
+    categories and "no function call" for the (ir)relevance ones. ``deep_calls``
+    are decoded objects nested beyond our record safeguard; they are ordinary
+    calls here, so BFCL's own checker grades them.
     """
+    calls = [*calls, *deep_calls]
     if is_relevance_or_irrelevance(case.category):
-        return score_relevance(case.category, bool(calls or too_deep) and not malformed)
-    if malformed or too_deep:
-        return Verdict(False, [*malformed, *too_deep])
+        return score_relevance(case.category, bool(calls) and not malformed)
+    if malformed:
+        return Verdict(False, malformed)
     # The expected answer is read here, after the model has answered, and goes
     # nowhere but the checker. BFCL checks against the schema as stored (without
     # the language note), so ``case.functions`` is passed, not the tools sent.

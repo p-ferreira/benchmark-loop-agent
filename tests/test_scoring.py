@@ -86,10 +86,14 @@ class RelevanceScoringTests(unittest.TestCase):
         self.assertFalse(score_calls(case_by_id("live_relevance"), self.CALL, bad).passed)
 
     def test_deeply_nested_arguments_still_count_as_a_call(self) -> None:
-        deep = ["arguments for f are nested too deeply"]
+        deep = self.CALL
         self.assertTrue(score_calls(case_by_id("live_relevance"), [], [], deep).passed)
         self.assertFalse(score_calls(case_by_id("irrelevance"), [], [], deep).passed)
-        self.assertFalse(score_calls(case_by_id("simple_python"), [], [], deep).passed)
+
+    def test_deep_calls_reach_the_bfcl_checker(self) -> None:
+        verdict = score_calls(case_by_id("simple_python"), [], [], [{"calculate_triangle_area": {"x": {}}}])
+        self.assertFalse(verdict.passed)
+        self.assertIn("Missing required parameter", verdict.reasons[0])
 
     def test_no_expected_answer_file_exists_for_these_categories(self) -> None:
         from benchmark_loop_agent.dataset import answer_path

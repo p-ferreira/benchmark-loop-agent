@@ -70,10 +70,10 @@ class ProviderResponse:
     malformed: list[str] = field(default_factory=list)
     unscorable_calls: list[dict[str, Any]] = field(default_factory=list)
     # Calls whose arguments decode as a JSON object but nest deeper than our record
-    # safeguard allows. Decoding succeeded, so BFCL's presence rule counts them as
-    # calls; only the AST categories treat them as unscorable. Kept apart from
-    # ``malformed`` so the safeguard never changes a relevance grade.
-    too_deep: list[str] = field(default_factory=list)
+    # safeguard allows. They are scored by BFCL like any other call (the safeguard
+    # never decides a grade); only the record keeps the bounded text in
+    # ``unscorable_calls`` instead of the decoded object.
+    deep_calls: list[BfclCall] = field(default_factory=list)
 
 
 def send_request(
@@ -126,7 +126,7 @@ def request_openai(api_key: str, model: str, case: Case, send: Send) -> Provider
         usage = reply.get("usage") or {}
         calls: list[BfclCall] = []
         malformed: list[str] = []
-        deep: list[str] = []
+        deep: list[BfclCall] = []
         unscorable: list[dict[str, Any]] = []
         # The reply's "output" list mixes item types (reasoning, text, tool calls).
         # Only "function_call" items are tool calls.
@@ -149,7 +149,7 @@ def request_openai(api_key: str, model: str, case: Case, send: Send) -> Provider
                 unscorable.append({name: raw_arguments})
                 continue
             if too_deep(arguments):
-                deep.append(f"arguments for {name} are nested too deeply")
+                deep.append({name: arguments})
                 unscorable.append({name: raw_arguments})
                 continue
             calls.append({name: arguments})
@@ -191,7 +191,7 @@ def request_anthropic(api_key: str, model: str, case: Case, send: Send) -> Provi
         # Tool calls are "tool_use" blocks in the content list; "input" is already a dict.
         calls: list[BfclCall] = []
         malformed: list[str] = []
-        deep: list[str] = []
+        deep: list[BfclCall] = []
         unscorable: list[dict[str, Any]] = []
         for block in reply["content"]:
             if block["type"] != "tool_use":
@@ -199,8 +199,10 @@ def request_anthropic(api_key: str, model: str, case: Case, send: Send) -> Provi
             if too_deep(block["input"]):  # lists too: deep non-objects must not reach recursive redaction
                 # A deep object still decoded (a call for BFCL's presence rule);
                 # a deep non-object is not a call at all.
-                (deep if isinstance(block["input"], dict) else malformed).append(
-                    f"input for {block['name']} is nested too deeply")
+                if isinstance(block["input"], dict):
+                    deep.append({block["name"]: block["input"]})
+                else:
+                    malformed.append(f"input for {block['name']} is nested too deeply")
                 unscorable.append({block["name"]: printable_text(block["input"])})
             elif isinstance(block["input"], dict):
                 calls.append({block["name"]: block["input"]})

@@ -82,6 +82,20 @@ def write_manifest(directory: Path, parameters: dict[str, Any], session: dict[st
     os.replace(temporary, path)
 
 
+def migrate_legacy_concurrency(directory: Path) -> None:
+    """Move a global ``concurrency`` (the earlier manifest format) into the sessions that ran with it."""
+    path = directory / MANIFEST_FILE
+    manifest = json.loads(path.read_text())
+    legacy = manifest["parameters"].pop("concurrency", None)
+    if legacy is None:
+        return
+    for session in manifest.get("sessions", []):
+        session.setdefault("concurrency", legacy)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(manifest, indent=2) + "\n")
+    os.replace(temporary, path)
+
+
 def read_manifest(directory: Path) -> dict[str, Any] | None:
     path = directory / MANIFEST_FILE
     return json.loads(path.read_text()) if path.exists() else None

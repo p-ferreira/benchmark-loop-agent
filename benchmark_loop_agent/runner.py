@@ -96,7 +96,7 @@ def run_provider(
     # Scoring is the only step that reads expected answers, and it runs after
     # the model has answered.
     try:
-        verdict = score_calls(case, response.calls, response.malformed, response.too_deep)
+        verdict = score_calls(case, response.calls, response.malformed, response.deep_calls)
     except ReferenceDataError as error:
         # Our data is unreadable, not the model wrong: unscored, so a resume retries it.
         return record("unscored", [str(error)], calls=response.calls + response.unscorable_calls,
