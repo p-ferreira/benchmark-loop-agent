@@ -7,6 +7,12 @@ BFCL's own checker, and writes one record per case and provider to disk. A
 returned call is only compared with the expected answer. It is never executed.
 An interrupted run resumes without repeating finished cases.
 
+## Results
+
+Finished runs, with their records and reports, are in [`results/`](results/README.md). The first is every
+single-turn BFCL case on `gpt-6-sol` and `claude-opus-5-5`:
+[results/phase-0](results/phase-0/README.md).
+
 ## Install
 
 Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/). Requests are
