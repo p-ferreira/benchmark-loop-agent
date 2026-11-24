@@ -76,6 +76,17 @@ class AdapterTests(unittest.TestCase):
                 self.assertEqual(graded.outcome, "fail")
                 self.assertIn("Missing required parameter", graded.reasons[0])  # BFCL's checker graded it
 
+    def test_record_keeps_provider_order_when_a_deep_call_comes_first(self) -> None:
+        deep: dict[str, Any] = {}
+        for _ in range(50):
+            deep = {"a": deep}
+        replies = {"openai": openai_reply([{"first": json.dumps(deep)}, {NAME: json.dumps(RIGHT)}], raw=True),
+                   "anthropic": anthropic_reply([{"first": deep}, {NAME: RIGHT}])}
+        for provider, reply in replies.items():
+            with self.subTest(provider=provider):
+                names = [next(iter(call)) for call in run(provider, reply)[0].returned_calls]
+                self.assertEqual(names, ["first", NAME])
+
     def test_non_object_anthropic_input_fails_and_is_kept(self) -> None:
         record, _ = run("anthropic", anthropic_reply([{NAME: "oops"}]))
         self.assertEqual((record.outcome, record.returned_calls), ("fail", [{NAME: "oops"}]))

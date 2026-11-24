@@ -99,18 +99,18 @@ def run_provider(
         verdict = score_calls(case, response.calls, response.malformed, response.deep_calls)
     except ReferenceDataError as error:
         # Our data is unreadable, not the model wrong: unscored, so a resume retries it.
-        return record("unscored", [str(error)], calls=response.calls + response.unscorable_calls,
+        return record("unscored", [str(error)], calls=response.calls_for_record,
                       response=response, latency=latency)
     except Exception as error:
         # The response arrived but the checker could not judge it (for example a
         # value of a type it does not expect), so it is a wrong answer, and the
         # reason says what happened. It must not stop the run.
         return record("fail", [f"scorer raised {type(error).__name__}: {error}"],
-                      calls=response.calls + response.unscorable_calls, response=response, latency=latency)
+                      calls=response.calls_for_record, response=response, latency=latency)
     return record(
         "pass" if verdict.passed else "fail",
         verdict.reasons,
-        calls=response.calls + response.unscorable_calls,
+        calls=response.calls_for_record,
         response=response,
         latency=latency,
     )

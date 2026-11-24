@@ -74,6 +74,14 @@ class ProviderResponse:
     # never decides a grade); only the record keeps the bounded text in
     # ``unscorable_calls`` instead of the decoded object.
     deep_calls: list[BfclCall] = field(default_factory=list)
+    # Every tool call as the record shows it (the decoded call, or the entry kept in
+    # ``unscorable_calls``), in the order the provider returned them. Empty means
+    # the adapter did not track order: the record then lists ``calls`` first.
+    record_calls: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def calls_for_record(self) -> list[dict[str, Any]]:
+        return self.record_calls or self.calls + self.unscorable_calls
 
 
 def send_request(
@@ -128,6 +136,7 @@ def request_openai(api_key: str, model: str, case: Case, send: Send) -> Provider
         malformed: list[str] = []
         deep: list[BfclCall] = []
         unscorable: list[dict[str, Any]] = []
+        ordered: list[dict[str, Any]] = []
         # The reply's "output" list mixes item types (reasoning, text, tool calls).
         # Only "function_call" items are tool calls.
         for item in reply["output"]:
@@ -143,18 +152,22 @@ def request_openai(api_key: str, model: str, case: Case, send: Send) -> Provider
                 # limit; RecursionError covers absurdly deep nesting.
                 malformed.append(f"arguments for {name} are not valid JSON")
                 unscorable.append({name: raw_arguments})
+                ordered.append(unscorable[-1])
                 continue
             if not isinstance(arguments, dict):
                 malformed.append(f"arguments for {name} are not a JSON object")
                 unscorable.append({name: raw_arguments})
+                ordered.append(unscorable[-1])
                 continue
             if too_deep(arguments):
                 deep.append({name: arguments})
                 unscorable.append({name: raw_arguments})
+                ordered.append(unscorable[-1])
                 continue
             calls.append({name: arguments})
+            ordered.append(calls[-1])
         return ProviderResponse(
-            reply.get("model"), calls, usage.get("input_tokens"), usage.get("output_tokens"), malformed, unscorable, deep
+            reply.get("model"), calls, usage.get("input_tokens"), usage.get("output_tokens"), malformed, unscorable, deep, ordered
         )
     except (KeyError, IndexError, TypeError) as error:
         raise ProviderError(f"unexpected OpenAI response shape: {type(error).__name__}: {error}") from None
@@ -193,6 +206,7 @@ def request_anthropic(api_key: str, model: str, case: Case, send: Send) -> Provi
         malformed: list[str] = []
         deep: list[BfclCall] = []
         unscorable: list[dict[str, Any]] = []
+        ordered: list[dict[str, Any]] = []
         for block in reply["content"]:
             if block["type"] != "tool_use":
                 continue
@@ -204,13 +218,16 @@ def request_anthropic(api_key: str, model: str, case: Case, send: Send) -> Provi
                 else:
                     malformed.append(f"input for {block['name']} is nested too deeply")
                 unscorable.append({block["name"]: printable_text(block["input"])})
+                ordered.append(unscorable[-1])
             elif isinstance(block["input"], dict):
                 calls.append({block["name"]: block["input"]})
+                ordered.append(calls[-1])
             else:
                 malformed.append(f"input for {block['name']} is not a JSON object")
                 unscorable.append({block["name"]: block["input"]})
+                ordered.append(unscorable[-1])
         return ProviderResponse(
-            reply.get("model"), calls, usage.get("input_tokens"), usage.get("output_tokens"), malformed, unscorable, deep
+            reply.get("model"), calls, usage.get("input_tokens"), usage.get("output_tokens"), malformed, unscorable, deep, ordered
         )
     except (KeyError, TypeError) as error:
         raise ProviderError(f"unexpected Anthropic response shape: {type(error).__name__}: {error}") from None
