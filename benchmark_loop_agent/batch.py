@@ -15,7 +15,7 @@ from .runner import PROVIDERS, run_provider
 from .sampling import select_cases
 from .providers import Send
 from .tracing import API_KEY_ENV, Tracing
-from .store import RecordStore, migrate_legacy_concurrency, now, read_manifest, read_records, write_manifest
+from .store import RecordStore, migrate_legacy_concurrency, now, read_manifest, read_records, selection_fingerprint, write_manifest
 
 
 @dataclass(frozen=True)
@@ -71,6 +71,14 @@ def run_batch(
             )
 
     cases = select_cases(parameters.categories, parameters.sample_size, parameters.seed, parameters.split)
+    selection = dict(Counter(case.category for case in cases))
+    selection = {category: selection.get(category, 0) for category in parameters.categories}
+    fingerprint = selection_fingerprint(case.case_id for case in cases)
+    if previous is not None and _selected_differently(previous, selection, fingerprint):
+        raise ValueError(
+            f"{directory} selected other cases than these parameters select now (the split file or the "
+            "dataset changed since); use a new --output-dir"
+        )
     store = RecordStore(directory)
     finished = store.open_for_resume()
     pending = [(name, case) for case in cases for name in parameters.providers
@@ -80,9 +88,7 @@ def run_batch(
     run_id = (previous or {}).get("run_id") or uuid.uuid4().hex
     tracing = tracing_for(run_id) if tracing_for else None
     session: dict[str, Any] = {"number": number, "concurrency": parameters.concurrency, "started_at": now(), "ended_at": None, "wall_seconds": None}
-    selection = dict(Counter(case.category for case in cases))
-    selection = {category: selection.get(category, 0) for category in parameters.categories}
-    write_manifest(directory, parameters.identity(), session, run_id, selection)
+    write_manifest(directory, parameters.identity(), session, run_id, selection, fingerprint)
     started = time.perf_counter()
     retrying = with_retries(send, sleep=sleep)
 
@@ -109,6 +115,13 @@ def run_batch(
         if tracing is not None:
             tracing.shutdown()
     return new_records + _kept(directory, cases, parameters.providers, {(r.provider, r.case_id) for r in new_records})
+
+
+def _selected_differently(previous: dict[str, Any], selection: dict[str, int], fingerprint: str) -> bool:
+    """Whether the saved run selected other cases; a run that recorded no selection cannot be checked."""
+    if "selection_fingerprint" in previous:
+        return previous["selection_fingerprint"] != fingerprint
+    return isinstance(previous.get("selection"), dict) and previous["selection"] != selection
 
 
 def _refuse_credentials_as_models(parameters: RunParameters, environment: Mapping[str, str]) -> None:

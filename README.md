@@ -353,7 +353,11 @@ providers, models, split part, categories, sample size and seed) and it writes
 `repeated-<provider>-<model>.md`: the lowest, highest and mean comparison
 figure and the number of runs, per category and overall. Directories whose
 configurations differ, or a run whose figure is unavailable, are refused with a
-message that says why.
+message that says why. Each run also records a fingerprint of the case ids it
+selected; runs that selected other cases (for example after the split file was
+rebuilt with another seed) are refused, as is resuming a directory after that
+change. The order of the categories or providers does not matter. A run that
+selected no cases has no overall figure and is refused.
 
 ```sh
 uv run --locked python -m benchmark_loop_agent.report runs/a runs/b runs/c --output-dir runs/spread

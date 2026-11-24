@@ -5,12 +5,13 @@ and flushed as each case finishes. ``run.json`` holds the run's parameters, the
 dataset and scorer revisions, and the start and end time of every invocation.
 """
 
+import hashlib
 import json
 import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .dataset import DATASET_REVISION
 from .record import Record
@@ -18,6 +19,11 @@ from .scoring import SCORER_REVISION
 
 RECORDS_FILE = "records.jsonl"
 MANIFEST_FILE = "run.json"
+
+
+def selection_fingerprint(case_ids: Iterable[str]) -> str:
+    """A digest of the selected case identifiers, whether or not each has a record."""
+    return hashlib.sha256("\n".join(sorted(set(case_ids))).encode()).hexdigest()
 
 
 def now() -> str:
@@ -69,7 +75,7 @@ class RecordStore:
 
 
 def write_manifest(directory: Path, parameters: dict[str, Any], session: dict[str, Any], run_id: str | None = None,
-                   selection: dict[str, int] | None = None) -> None:
+                   selection: dict[str, int] | None = None, fingerprint: str | None = None) -> None:
     """Create or update ``run.json``; each invocation is one numbered entry in ``sessions``."""
     path = directory / MANIFEST_FILE
     manifest: dict[str, Any] = json.loads(path.read_text()) if path.exists() else {}
@@ -78,6 +84,8 @@ def write_manifest(directory: Path, parameters: dict[str, Any], session: dict[st
     )
     if selection is not None:  # how many cases each category holds in this run, for the report to compare with
         manifest["selection"] = selection
+    if fingerprint is not None:  # which cases, so runs and resumes that selected others are told apart
+        manifest["selection_fingerprint"] = fingerprint
     if run_id and "run_id" not in manifest:  # one identifier for the run, kept across resumes
         manifest["run_id"] = run_id
     sessions = manifest.setdefault("sessions", [])

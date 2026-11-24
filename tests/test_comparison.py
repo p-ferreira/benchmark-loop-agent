@@ -3,6 +3,7 @@
 import json
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from benchmark_loop_agent import report
@@ -69,16 +70,28 @@ class SplitRunTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 run_batch(directory, parameters(split=other, sample_size=2), ENV, FakeSend(perfect), sleep=lambda s: None)
 
+    def test_a_resume_after_the_selection_changed_is_refused_before_anything_changes(self) -> None:
+        directory = Path(tempfile.mkdtemp()) / "out"
+        params = parameters(sample_size=1, categories=("simple_python",), providers=("openai",))
+        run_batch(directory, params, ENV, FakeSend(perfect), sleep=lambda s: None)
+        before = {n: (directory / n).read_bytes() for n in ("run.json", "records.jsonl")}
+        other = [c for c in select_cases(("simple_python",), None, 0) if c.case_id not in before["records.jsonl"].decode()][:1]
+        with unittest.mock.patch("benchmark_loop_agent.batch.select_cases", return_value=other):
+            with self.assertRaisesRegex(ValueError, "other cases"):
+                run_batch(directory, params, ENV, FakeSend(perfect), sleep=lambda s: None)
+        self.assertEqual(before, {n: (directory / n).read_bytes() for n in before})
+
     def test_a_run_without_split_saves_no_split_key(self) -> None:
         directory = Path(tempfile.mkdtemp()) / "out"
         run_batch(directory, parameters(sample_size=1), ENV, FakeSend(perfect), sleep=lambda s: None)
         self.assertNotIn("split", json.loads((directory / "run.json").read_text())["parameters"])
 
 
-def fixture_run(passes, selected=("a1", "a2", "a3", "a4"), model="gpt-known", split=None, selection="default"):
+def fixture_run(passes, selected=("a1", "a2", "a3", "a4"), model="gpt-known", split=None, selection="default", ids="fp"):
     records = [record("openai", c, "simple_python", "pass" if c in passes else "fail") for c in selected]
     m = manifest([], categories=("simple_python",), selection={"simple_python": len(selected)} if selection == "default" else selection)
     m["parameters"]["providers"] = ["openai"]
+    m["selection_fingerprint"] = ids
     m["parameters"]["models"] = {"openai": model}
     if split:
         m["parameters"]["split"] = split
@@ -113,6 +126,24 @@ class RepeatTests(unittest.TestCase):
         c = fixture_run({"a1"}, split="held-out")
         with self.assertRaisesRegex(ValueError, "split"):
             spreads(["r1", "r2"], [a[0], c[0]], [a[1], c[1]])
+
+    def test_runs_that_selected_other_cases_are_refused(self) -> None:
+        a, b = fixture_run({"a1"}), fixture_run({"a1"}, ids="other")
+        with self.assertRaisesRegex(ValueError, "cases selected"):
+            spreads(["r1", "r2"], [a[0], b[0]], [a[1], b[1]])
+
+    def test_a_reordered_category_or_provider_list_is_the_same_configuration(self) -> None:
+        a, b = fixture_run({"a1"}), fixture_run({"a1"})
+        a[0]["parameters"]["categories"] = ["simple_python", "irrelevance"]
+        b[0]["parameters"]["categories"] = ["irrelevance", "simple_python"]
+        for m, _ in (a, b):
+            m["selection"]["irrelevance"] = 0
+        self.assertEqual(spreads(["r1", "r2"], [a[0], b[0]], [a[1], b[1]])["openai"]["overall"]["runs"], 2)
+
+    def test_runs_with_no_selected_cases_are_refused(self) -> None:
+        a, b = fixture_run(set(), selected=()), fixture_run(set(), selected=())
+        with self.assertRaisesRegex(ValueError, "r1.*undefined"):
+            spreads(["r1", "r2"], [a[0], b[0]], [a[1], b[1]])
 
     def test_a_run_with_an_unavailable_figure_is_refused(self) -> None:
         a, b = fixture_run({"a1"}), fixture_run({"a1"}, selection=None)

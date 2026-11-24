@@ -15,6 +15,7 @@ no question, tool or answer text.
 
 import argparse
 import json
+import math
 import random
 import sys
 from collections import Counter
@@ -103,8 +104,8 @@ def assign_groups(groups: Sequence[Sequence[Case]], fractions: dict[str, float],
 
 def build_split(seed: int, percentages: dict[str, float]) -> dict[str, Any]:
     """Build the split document from the question files alone."""
-    if set(percentages) != set(PARTS) or any(p < 0 for p in percentages.values()):
-        raise ValueError("give a non-negative percentage for each of " + ", ".join(PARTS))
+    if set(percentages) != set(PARTS) or not all(math.isfinite(p) for p in percentages.values()) or any(p < 0 for p in percentages.values()):
+        raise ValueError("give a finite, non-negative percentage for each of " + ", ".join(PARTS))
     if abs(sum(percentages.values()) - 100) > 1e-9:
         raise ValueError(f"the percentages must add up to 100, not {sum(percentages.values())}")
     cases = [case for category in CATEGORIES for case in load_cases(category)]

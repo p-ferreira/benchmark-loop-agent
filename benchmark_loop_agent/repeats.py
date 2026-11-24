@@ -19,13 +19,21 @@ def configuration(manifest: dict[str, Any]) -> dict[str, Any]:
     return {key: params.get(key) for key in CONFIGURATION_KEYS}
 
 
+# These lists name a set: sampling seeds each category on its own, so their order changes nothing.
+UNORDERED_KEYS = ("providers", "categories")
+
+
+def _comparable(key: str, value: Any) -> Any:
+    return sorted(value) if key in UNORDERED_KEYS and isinstance(value, list) else value
+
+
 def check_same_configuration(names: Sequence[str], manifests: Sequence[dict[str, Any]]) -> None:
     """Refuse runs whose configurations differ, naming the first difference found."""
     first = configuration(manifests[0])
     for name, manifest in zip(names[1:], manifests[1:]):
         other = configuration(manifest)
         for key in CONFIGURATION_KEYS:
-            if other[key] != first[key]:
+            if _comparable(key, other[key]) != _comparable(key, first[key]):
                 raise ValueError(f"{name} differs from {names[0]} in {key}: {other[key]!r} instead of {first[key]!r}")
 
 
@@ -45,6 +53,12 @@ def spreads(names: Sequence[str], manifests: Sequence[dict[str, Any]],
             records: Sequence[Sequence[dict[str, Any]]]) -> dict[str, dict[str, dict[str, Any]]]:
     """Per provider, the spread over the runs; raises ``ValueError`` for a refused set of runs."""
     check_same_configuration(names, manifests)
+    for name, manifest in zip(names, manifests):
+        if manifest.get("selection_fingerprint") is None:
+            raise ValueError(f"{name} does not record which cases it selected, so it cannot be compared with other runs")
+    for name, manifest in zip(names[1:], manifests[1:]):
+        if manifest["selection_fingerprint"] != manifests[0]["selection_fingerprint"]:
+            raise ValueError(f"{name} differs from {names[0]} in the cases selected (the split file or dataset changed)")
     result = {}
     for provider in manifests[0]["parameters"]["providers"]:
         runs = []
@@ -53,6 +67,8 @@ def spreads(names: Sequence[str], manifests: Sequence[dict[str, Any]],
             if counts is None:
                 raise ValueError(f"{name} does not record the cases it selected, so its comparison figure is unavailable")
             runs.append(counts)
+        if not runs[0][OVERALL][1]:
+            raise ValueError(f"{names[0]} selected no cases, so the overall figure is undefined")
         result[provider] = spread(runs)
     return result
 

@@ -77,6 +77,13 @@ class SplitTests(unittest.TestCase):
         for name in ("load_expected_answers", "answer_path", "possible_answer"):
             self.assertNotIn(name, source)
 
+class PercentageTests(unittest.TestCase):
+    def test_nonfinite_or_negative_percentages_are_refused(self) -> None:
+        for bad in (float("nan"), float("inf"), -1.0):
+            with self.assertRaisesRegex(ValueError, "finite"):
+                split.build_split(0, {"development": bad, "validation": 20.0, "held-out": 30.0})
+
+
 class ReadmeSplitCountTests(unittest.TestCase):
     def test_readme_states_cases_and_groups_per_part(self) -> None:
         readme = (DATA_DIR.parent / "README.md").read_text()
