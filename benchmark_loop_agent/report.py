@@ -63,6 +63,8 @@ def render(manifest: dict[str, Any], provider: str, records: list[dict[str, Any]
 
     selection = manifest.get("selection")  # cases per category in this run, saved when it started
     cap = params["sample_size"]  # a maximum: a category with fewer cases is taken whole
+    if selection is None and cap == 0:  # the saved cap alone proves nothing was selected in any category
+        selection = {c: 0 for c in params["categories"]}
     sampled = cap is not None
     size = {c: sum(1 for r in mine if r["category"] == c) for c in params["categories"]}
     problems, notes = [], []

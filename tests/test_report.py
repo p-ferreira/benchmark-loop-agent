@@ -100,6 +100,11 @@ class ReportTests(unittest.TestCase):
         text = report.render(manifest([DONE], selection={"simple_python": 0, "irrelevance": 0}), "openai", [], RATES)
         self.assertNotIn("Incomplete run", text)
 
+    def test_a_legacy_run_with_a_zero_cap_is_known_to_hold_nothing(self) -> None:
+        text = report.render(manifest([DONE], sample_size=0, selection=None), "openai", [], RATES)
+        self.assertNotIn("Completeness unknown", text)
+        self.assertNotIn("Incomplete run", text)
+
     def test_the_earlier_manifest_keeps_its_concurrency(self) -> None:
         old = {k: v for k, v in DONE.items() if k != "concurrency"}
         text = report.render(manifest([old], concurrency=7), "openai", RECORDS, RATES)
