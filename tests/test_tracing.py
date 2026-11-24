@@ -14,7 +14,7 @@ import requests
 
 from benchmark_loop_agent import tracing
 from benchmark_loop_agent.batch import RunParameters, run_batch
-from benchmark_loop_agent.dataset import load_cases
+from benchmark_loop_agent.dataset import answer_path, load_cases, load_expected_answers
 from benchmark_loop_agent.providers import send_request
 from benchmark_loop_agent.store import read_manifest, read_records
 from tests.receiver import Receiver
@@ -97,7 +97,7 @@ class TracingOn(TracingTestCase):
         spans = self.receiver.case_spans()
         records = read_records(self.directory / "records.jsonl")
         self.assertEqual(len(spans), len(records))
-        self.assertEqual(set(self.receiver.paths), {"/v1/traces"})  # base address plus the OTLP path
+        self.assertEqual(set(self.receiver.paths), {"/v1/traces", "/v1/span_annotations"})  # base address plus each path
         run_id = read_manifest(self.directory)["run_id"]
         for span in spans:
             a = span["attributes"]
@@ -170,6 +170,144 @@ class TracingOn(TracingTestCase):
         record = logging.LogRecord("opentelemetry", logging.ERROR, "", 0, "failed with %s", (PHOENIX_KEY,), None)
         self.assertTrue(tracing._Redact(PHOENIX_KEY).filter(record))
         self.assertNotIn(PHOENIX_KEY, record.getMessage())
+
+
+class CaseSpanContent(TracingTestCase):
+    """The case span's input, output and status; the scoring span; the annotation of each verdict."""
+
+    def by_case(self):
+        return {s["attributes"]["benchmark.case_id"]: s for s in self.receiver.case_spans()}
+
+    def test_a_pass_has_input_output_and_status_ok(self) -> None:
+        self.run_batch(FakeSend(perfect), self.env(), sample_size=1)
+        (span,) = self.receiver.case_spans()
+        (record,) = read_records(self.directory / "records.jsonl")
+        a = span["attributes"]
+        question = next(c for c in load_cases("simple_python") if c.case_id == record["case_id"]).messages[0]["content"]
+        self.assertEqual(a["input.value"], question)
+        self.assertEqual(a["input.mime_type"], "text/plain")
+        self.assertEqual(json.loads(a["output.value"]), record["returned_calls"])
+        self.assertEqual(a["output.mime_type"], "application/json")
+        self.assertEqual(span["status"], (1, ""))  # STATUS_CODE_OK
+
+    def test_a_fail_is_a_completed_case_not_an_error(self) -> None:
+        self.run_batch(FakeSend(wrong), self.env(), sample_size=1)
+        (span,) = self.receiver.case_spans()
+        self.assertEqual(span["status"], (1, ""))
+        self.assertEqual(json.loads(span["attributes"]["output.value"]),
+                         [{"calculate_triangle_area": {"base": 99, "height": 1}}])
+
+    def test_an_unscored_case_is_an_error_with_the_reason(self) -> None:
+        env = {"PHOENIX_COLLECTOR_ENDPOINT": self.receiver.url, "OPENAI_MODEL": "requested-model"}
+        self.run_batch(FakeSend(perfect), env, sample_size=1)
+        (span,) = self.receiver.case_spans()
+        self.assertEqual(span["status"], (2, "OPENAI_API_KEY is not set"))
+        self.assertIn("input.value", span["attributes"])
+        self.assertNotIn("output.value", span["attributes"])  # no reply, no output
+        self.assertEqual(self.receiver.scoring_spans(), [])  # scoring never ran
+
+    def test_a_failed_request_has_no_scoring_span_and_still_an_annotation(self) -> None:
+        self.run_batch(FakeSend(RuntimeError("down")), self.env(), sample_size=1)
+        self.assertEqual(self.receiver.scoring_spans(), [])
+        (annotation,) = self.receiver.annotations
+        self.assertEqual(annotation["result"], {"label": "unscored", "explanation": "RuntimeError: down"})
+
+    def test_scoring_span_with_an_expected_answer(self) -> None:
+        self.run_batch(FakeSend(wrong), self.env(), sample_size=1)
+        (case,), (scoring,) = self.receiver.case_spans(), self.receiver.scoring_spans()
+        self.assertEqual((scoring["parent_id"], scoring["trace_id"]), (case["span_id"], case["trace_id"]))
+        a = scoring["attributes"]
+        self.assertEqual(a["openinference.span.kind"], "EVALUATOR")
+        data = json.loads(a["input.value"])
+        self.assertEqual(data["returned_calls"], [{"calculate_triangle_area": {"base": 99, "height": 1}}])
+        self.assertEqual(data["expected_answer"],
+                         load_expected_answers("simple_python")[case["attributes"]["benchmark.case_id"]])
+        output = json.loads(a["output.value"])
+        self.assertEqual(output["verdict"], "fail")
+        self.assertEqual(output["reason"], case["attributes"]["benchmark.failure_reason"])
+
+    def test_scoring_span_of_a_category_without_an_expected_answer(self) -> None:
+        self.run_batch(FakeSend(wrong), self.env(), categories=("irrelevance",), sample_size=1)
+        (scoring,) = self.receiver.scoring_spans()
+        data = json.loads(scoring["attributes"]["input.value"])
+        self.assertIsNone(data["expected_answer"])
+        self.assertIn("BFCL's relevance rule", data["note"])
+        self.assertIn("no expected answer", data["note"])
+        self.assertEqual(json.loads(scoring["attributes"]["output.value"])["verdict"], "fail")
+
+    def test_the_expected_answer_is_read_only_after_the_reply_and_never_sent_when_unscored(self) -> None:
+        order: list[str] = []
+        real = answer_path
+        send = FakeSend(lambda p, r: order.append("request") or perfect(p, r))
+        with mock.patch("benchmark_loop_agent.dataset.answer_path", lambda c: order.append("answer") or real(c)):
+            load_expected_answers.cache_clear()
+            self.run_batch(send, self.env(), sample_size=1)
+        load_expected_answers.cache_clear()
+        self.assertEqual(order[0], "request")
+        self.assertIn("answer", order)
+        other = Receiver()
+        self.addCleanup(other.close)
+        env = {"PHOENIX_COLLECTOR_ENDPOINT": other.url, "OPENAI_MODEL": "requested-model"}  # no key: no reply
+        run_batch(Path(tempfile.mkdtemp()) / "o", parameters(sample_size=1), env, FakeSend(perfect),
+                  sleep=lambda s: None, tracing_for=lambda run_id: tracing.configure(env, run_id))
+        sent = json.dumps(other.spans)
+        for answer in load_expected_answers("simple_python").values():
+            self.assertNotIn(json.dumps(json.dumps(answer))[1:-1], sent)
+        self.assertEqual(other.scoring_spans(), [])
+
+    def test_each_verdict_is_one_annotation_on_its_case_span(self) -> None:
+        for send, label, score in ((FakeSend(perfect), "pass", 1), (FakeSend(wrong), "fail", 0)):
+            self.receiver.annotations.clear()
+            self.receiver.spans.clear()
+            self.run_batch(send, self.env(), directory=Path(tempfile.mkdtemp()) / "out")
+            spans = self.receiver.case_spans()
+            self.assertEqual(len(self.receiver.annotations), len(spans))
+            self.assertEqual({a["span_id"] for a in self.receiver.annotations}, {s["span_id"] for s in spans})
+            for annotation in self.receiver.annotations:
+                self.assertEqual((annotation["name"], annotation["annotator_kind"]), ("bfcl", "CODE"))
+                self.assertEqual(annotation["result"]["label"], label)
+                self.assertEqual(annotation["result"]["score"], score)
+                span = next(s for s in spans if s["span_id"] == annotation["span_id"])
+                self.assertEqual(annotation["result"].get("explanation"),
+                                 span["attributes"].get("benchmark.failure_reason"))
+
+    def test_unscored_annotation_has_a_label_and_no_score(self) -> None:
+        self.run_batch(FakeSend(RuntimeError("down")), self.env(), sample_size=1)
+        (annotation,) = self.receiver.annotations
+        self.assertEqual(annotation["result"]["label"], "unscored")
+        self.assertNotIn("score", annotation["result"])
+
+    def test_annotations_are_posted_to_the_configured_address_with_the_key(self) -> None:
+        self.run_batch(FakeSend(wrong), self.env(PHOENIX_API_KEY=PHOENIX_KEY), sample_size=1)
+        self.assertIn("/v1/span_annotations", self.receiver.paths)
+        self.assertEqual(self.receiver.headers[-1]["authorization"], f"Bearer {PHOENIX_KEY}")
+        self.assertNotIn(PHOENIX_KEY, json.dumps(self.receiver.annotations))
+
+    def test_nothing_is_sent_with_the_endpoint_unset(self) -> None:
+        self.run_batch(FakeSend(wrong), environment("openai"))
+        self.assertEqual((self.receiver.paths, self.receiver.annotations), ([], []))
+
+    def test_annotation_failures_change_nothing(self) -> None:
+        expected, outcomes = ExportFailures.baseline(self, FakeSend(wrong))
+        for status, delay in ((500, 0), (200, 3)):
+            directory = Path(tempfile.mkdtemp()) / "out"
+            self.receiver.annotation_status, self.receiver.annotation_delay = status, delay
+            with mock.patch.object(tracing, "ANNOTATION_TIMEOUT_SECONDS", 1), contextlib.redirect_stderr(io.StringIO()):
+                records = self.run_batch(FakeSend(wrong), self.env(), directory=directory)
+            self.assertEqual(stable(read_records(directory / "records.jsonl")), expected)
+            self.assertEqual([r.outcome for r in records], outcomes)
+            self.assertEqual(sorted(p.name for p in directory.iterdir()), ["records.jsonl", "run.json"])
+        with mock.patch("requests.adapters.HTTPAdapter.send", side_effect=requests.ConnectionError("refused")):
+            records = self.run_batch(FakeSend(wrong), self.env(), directory=Path(tempfile.mkdtemp()) / "out")
+        self.assertEqual([r.outcome for r in records], outcomes)
+
+    def test_a_failed_annotation_send_is_not_repeated_on_resume(self) -> None:
+        self.receiver.annotation_status = 500
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.run_batch(FakeSend(wrong), self.env())
+        self.receiver.annotation_status = 200
+        self.run_batch(FakeSend(wrong), self.env())
+        self.assertEqual(self.receiver.annotations, [])
 
 
 class Redaction(TracingTestCase):

@@ -15,14 +15,16 @@ import contextlib
 import json
 import logging
 import sys
+import time
 import traceback
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
+import requests
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import Event, ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from opentelemetry.trace import Link
-from opentelemetry.trace.status import Status
+from opentelemetry.trace.status import Status, StatusCode
 
 ENDPOINT_ENV = "PHOENIX_COLLECTOR_ENDPOINT"
 API_KEY_ENV = "PHOENIX_API_KEY"
@@ -32,6 +34,14 @@ OTLP_PATH = "/v1/traces"
 EXPORT_TIMEOUT_SECONDS = 5
 FLUSH_TIMEOUT_MILLIS = 10_000
 SPAN_NAME = "benchmark_case"
+SCORING_SPAN_NAME = "bfcl_scoring"
+ANNOTATION_PATH = "/v1/span_annotations"
+ANNOTATION_NAME = "bfcl"
+ANNOTATION_TIMEOUT_SECONDS = 5
+ANNOTATION_TOTAL_SECONDS = 10
+ANNOTATION_BATCH = 100
+RELEVANCE_NOTE = ("BFCL's relevance rule: the model passes by making (or not making) a function call; "
+                  "this category holds no expected answer.")
 
 
 def scrub(value: Any, secrets: Sequence[str]) -> Any:
@@ -136,7 +146,12 @@ class Tracing:
     """A configured exporter. Build one with ``configure``; ``None`` means tracing is off."""
 
     def __init__(self, provider: Any, tracer: Any, run_id: str, instrumentors: tuple[Any, ...] = (),
-                 restore_logging: Callable[[], None] | None = None) -> None:
+                 restore_logging: Callable[[], None] | None = None, endpoint: str | None = None,
+                 api_key: str | None = None, secrets: Sequence[str] = ()) -> None:
+        self._endpoint = endpoint
+        self._api_key = api_key
+        self._secrets = [s for s in secrets if s]
+        self._annotations: list[dict[str, Any]] = []  # in memory only, never written to disk
         self._restore_logging = restore_logging
         self._instrumentors = instrumentors
         self._provider = provider
@@ -145,7 +160,7 @@ class Tracing:
 
     @contextlib.contextmanager
     def case(self, *, provider: str, requested_model: str | None, case_id: str,
-             category: str, invocation: int) -> Iterator["CaseSpan"]:
+             category: str, invocation: int, question: str | None = None) -> Iterator["CaseSpan"]:
         """The span of one attempt. Only facts known before the model replies go in at the start."""
         span = None
         try:
@@ -161,12 +176,15 @@ class Tracing:
             }
             if requested_model is not None:
                 attributes["benchmark.requested_model"] = requested_model
+            if question is not None:
+                attributes["input.value"] = question
+                attributes["input.mime_type"] = "text/plain"
             span = self._tracer.start_span(SPAN_NAME, attributes=attributes)
             token = trace.use_span(span, end_on_exit=False)
             token.__enter__()
         except Exception:
             span = token = None
-        handle = CaseSpan(span, {"run_id": self.run_id, "case_id": case_id, "category": category,
+        handle = CaseSpan(span, self, {"run_id": self.run_id, "case_id": case_id, "category": category,
                                  "provider": provider, "requested_model": requested_model,
                                  "invocation": invocation})
         try:
@@ -179,10 +197,35 @@ class Tracing:
                 with contextlib.suppress(Exception):
                     span.end()
 
+    def add_annotation(self, annotation: dict[str, Any]) -> None:
+        self._annotations.append(annotation)  # list.append is atomic: the runner's threads share it
+
+    def send_annotations(self) -> None:
+        """Send the ``bfcl`` annotations once, best effort, bounded in time; nothing is kept or retried."""
+        if not self._endpoint or not self._annotations:
+            return
+        deadline = time.monotonic() + ANNOTATION_TOTAL_SECONDS
+        headers = {"authorization": f"Bearer {self._api_key}"} if self._api_key else {}
+        url = self._endpoint.rstrip("/") + ANNOTATION_PATH
+        try:
+            for start in range(0, len(self._annotations), ANNOTATION_BATCH):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                batch = scrub(self._annotations[start:start + ANNOTATION_BATCH], self._secrets)
+                requests.post(url, json={"data": batch}, headers=headers,
+                              timeout=min(ANNOTATION_TIMEOUT_SECONDS, left))
+        except Exception as error:  # the type only: a message could carry the address or a key
+            print(f"annotations not sent: {type(error).__name__}", file=sys.stderr)
+        finally:
+            self._annotations = []
+
     def shutdown(self) -> None:
         """Send what is queued, within a time limit. A failure here is not reported as an error."""
         with contextlib.suppress(Exception):
             self._provider.force_flush(FLUSH_TIMEOUT_MILLIS)
+        with contextlib.suppress(Exception):
+            self.send_annotations()  # after the spans they belong to were exported
         with contextlib.suppress(Exception):
             self._provider.shutdown()
         for instrumentor in self._instrumentors:
@@ -196,13 +239,47 @@ class Tracing:
 class CaseSpan:
     """What the runner tells the span once the case is judged."""
 
-    def __init__(self, span: Any, metadata: dict[str, Any]) -> None:
+    def __init__(self, span: Any, tracing: Tracing, metadata: dict[str, Any]) -> None:
         self._span = span
+        self._tracing = tracing
         self._metadata = metadata
         self._outcome: tuple[Any, ...] | None = None
+        self._output: str | None = None
 
-    def outcome(self, record: Any) -> None:
+    def outcome(self, record: Any, case: Any = None) -> None:
+        """Called with the finished record: only now is the scoring span written and the expected answer read."""
         self._outcome = (record.outcome, record.actual_model, list(record.reasons))
+        try:
+            if record.returned_calls is not None:
+                self._output = json.dumps(record.to_dict()["returned_calls"])
+            if self._span is not None and record.outcome != "unscored":  # unscored: scoring never ran
+                self._score(record)
+        except Exception:
+            pass
+
+    def _score(self, record: Any) -> None:
+        from opentelemetry import trace
+
+        from .categories import is_relevance_or_irrelevance
+        from .dataset import load_expected_answers
+
+        payload: dict[str, Any] = {"returned_calls": record.to_dict()["returned_calls"]}
+        if is_relevance_or_irrelevance(record.category):
+            payload["expected_answer"] = None
+            payload["note"] = RELEVANCE_NOTE
+        else:
+            try:
+                payload["expected_answer"] = load_expected_answers(record.category).get(record.case_id)
+            except Exception:
+                payload["expected_answer"] = None
+        reason = "; ".join(record.reasons)
+        scoring = self._tracing._tracer.start_span(
+            SCORING_SPAN_NAME, context=trace.set_span_in_context(self._span),
+            attributes={"openinference.span.kind": "EVALUATOR",
+                        "input.value": json.dumps(payload), "input.mime_type": "application/json",
+                        "output.value": json.dumps({"verdict": record.outcome, "reason": reason}),
+                        "output.mime_type": "application/json"})
+        scoring.end()
 
     def finish(self) -> None:
         if self._span is None:
@@ -210,6 +287,9 @@ class CaseSpan:
         try:
             attributes: dict[str, Any] = {}
             metadata = dict(self._metadata)
+            if self._output is not None:
+                attributes["output.value"] = self._output
+                attributes["output.mime_type"] = "application/json"
             if self._outcome is not None:
                 verdict, actual_model, reasons = self._outcome
                 attributes["benchmark.verdict"] = verdict
@@ -220,6 +300,18 @@ class CaseSpan:
                 if actual_model is not None:  # absent, not invented, when no provider replied
                     attributes["benchmark.actual_model"] = actual_model
                     metadata["actual_model"] = actual_model
+                if verdict == "unscored":
+                    self._span.set_status(Status(StatusCode.ERROR, attributes.get("benchmark.failure_reason", "unscored")))
+                else:
+                    self._span.set_status(Status(StatusCode.OK))
+                result: dict[str, Any] = {"label": verdict}
+                if verdict != "unscored":
+                    result["score"] = 1 if verdict == "pass" else 0
+                if reasons:
+                    result["explanation"] = attributes["benchmark.failure_reason"]
+                self._tracing.add_annotation({
+                    "span_id": format(self._span.get_span_context().span_id, "016x"),
+                    "name": ANNOTATION_NAME, "annotator_kind": "CODE", "result": result})
             attributes["metadata"] = json.dumps(metadata)
             self._span.set_attributes(attributes)
         except Exception:
@@ -256,7 +348,8 @@ def configure(environment: Mapping[str, str], run_id: str) -> Tracing | None:
         instrumentors = (OpenAIInstrumentor(), AnthropicInstrumentor())
         for instrumentor in instrumentors:
             instrumentor.instrument(tracer_provider=provider)
-        return Tracing(provider, provider.get_tracer("benchmark_loop_agent"), run_id, instrumentors, restore_logging)
+        return Tracing(provider, provider.get_tracer("benchmark_loop_agent"), run_id, instrumentors, restore_logging,
+                       endpoint, api_key, secrets)
     except Exception as error:  # tracing must not stop the run
         for instrumentor in locals().get("instrumentors") or ():
             try:

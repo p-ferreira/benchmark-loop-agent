@@ -131,6 +131,13 @@ class ReportTests(unittest.TestCase):
         self.assertTrue(lines[2].startswith("> **Sampled run.**"))
         self.assertIn("at most 2 case(s) per category", lines[2])
 
+    def test_no_actual_model_is_said_so_also_when_a_provider_replied(self) -> None:
+        records = [record("openai", "a1", "simple_python", "pass", (10, 1), actual=None)]
+        records[0]["actual_model"] = None
+        text = self.render(records=records)
+        self.assertIn("none, no actual model was reported", text)
+        self.assertNotIn("no response arrived", text)
+
     def test_a_complete_full_run_has_no_warning(self) -> None:
         records = [r for r in RECORDS if r["outcome"] != "unscored"]
         text = self.render(records=records, selection={"simple_python": 2, "irrelevance": 2})

@@ -190,7 +190,18 @@ The `openai` and `anthropic` requests are recorded by the standard
 OpenInference instrumentation (`openinference-instrumentation-openai` and
 `-anthropic`); this code adds no span for what they already record. It adds
 one parent span, `benchmark_case`, per attempt at a case, so the
-instrumentation's request spans sit inside the case's trace.
+instrumentation's request spans sit inside the case's trace, and a second,
+`bfcl_scoring`, for the scoring. The verdict is also sent as a Phoenix
+annotation. A case is therefore one trace of three kinds of span:
+
+| Span | Made by | Holds |
+|------|---------|-------|
+| `benchmark_case` (kind `CHAIN`) | this code | input: the question; output: the calls the model returned, as the record keeps them; status: **error only when the case is `unscored`** (the reason is the message), OK for `pass` and `fail` (a wrong answer is not an error) |
+| `Response` / `messages.create` (kind `LLM`) | the instrumentation | the request, the reply, the tokens |
+| `bfcl_scoring` (kind `EVALUATOR`) | this code, after the reply | input: the returned calls and the expected answer; output: the verdict and the checker's reason. For categories without an expected-answer file the input says the rule is BFCL's relevance rule and holds no expected answer. A case that was not scored (no reply, or unreadable reference data) has no scoring span |
+
+No span is added for tool execution: the model only proposes calls here and
+nothing runs them; the calls are in the request span.
 
 Start a local Phoenix, then set the endpoint:
 
@@ -214,6 +225,18 @@ and `benchmark.invocation`, and a `metadata` JSON with the same facts. In
 Phoenix, filter for example with
 `metadata["category"] == "irrelevance" and metadata["verdict"] == "fail"`.
 
+**The `bfcl` annotation.** For every case of an invocation, once the spans
+have been exported, the run sends one span annotation on the `benchmark_case`
+span with `POST /v1/span_annotations` at the same address: name `bfcl`, label
+`pass`, `fail` or `unscored`, score 1 for pass and 0 for fail (none for
+unscored), the checker's reason as the explanation, annotator kind `CODE`.
+Phoenix then lists and counts pass and fail as a score. To see the failed cases
+of one category, filter the project's spans with
+`name == 'benchmark_case' and metadata["category"] == "simple_python" and evals["bfcl"].label == "fail"`
+(or filter on the annotation `bfcl` = `fail` in the UI); opening one shows the
+question, the returned calls, the expected answer in its `bfcl_scoring` child
+and the reason. Cases that could not be scored are the ones with error status.
+
 * **Each attempt is its own trace.** A case that was `unscored` and passes on a
   resume has two traces; the first stays `unscored`. Nothing rewrites a trace.
 * **Unscored before any reply** (a missing key, say): the trace has the
@@ -222,7 +245,11 @@ Phoenix, filter for example with
   case's span starts with the facts above only, and the verdict and reason are
   added after scoring. A failure reason from the checker can name the expected
   value; that is sent after the reply.
-* **Best effort.** A failed or slow export never changes a record, a verdict or
+* **Best effort.** Annotations are sent in one pass at the end of the run,
+  with a 5 second timeout per request and 10 seconds in all; a failed or slow
+  send is dropped, never retried on a resume, never kept on disk, and a
+  `PHOENIX_API_KEY` is sent with it as a bearer token and kept out of every log
+  and message. A failed or slow export never changes a record, a verdict or
   the exit code. A case whose export failed keeps its record and its trace is
   **not** sent again on a resume; no unsent trace is kept on disk. Traces of
   such a case are missing from Phoenix, not queued.
