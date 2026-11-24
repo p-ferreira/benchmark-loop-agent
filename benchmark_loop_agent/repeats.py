@@ -9,6 +9,7 @@ from statistics import fmean
 from typing import Any, Sequence
 
 from .comparison import OVERALL, comparison_counts
+from .store import selection_fingerprint
 
 CONFIGURATION_KEYS = ("providers", "models", "split", "categories", "sample_size", "seed")
 
@@ -49,15 +50,24 @@ def spread(runs: Sequence[dict[str, tuple[int, int]]]) -> dict[str, dict[str, An
     return result
 
 
+def _fingerprint(name: str, manifest: dict[str, Any], records: Sequence[dict[str, Any]]) -> str:
+    """The recorded selection digest; for an older run, the recorded cases when they fill its whole selection."""
+    if manifest.get("selection_fingerprint") is not None:
+        return manifest["selection_fingerprint"]
+    selection = manifest.get("selection")
+    ids = {r["case_id"] for r in records}
+    if isinstance(selection, dict) and len(ids) == sum(selection.values()):
+        return selection_fingerprint(ids)
+    raise ValueError(f"{name} does not record which cases it selected, so it cannot be compared with other runs")
+
+
 def spreads(names: Sequence[str], manifests: Sequence[dict[str, Any]],
             records: Sequence[Sequence[dict[str, Any]]]) -> dict[str, dict[str, dict[str, Any]]]:
     """Per provider, the spread over the runs; raises ``ValueError`` for a refused set of runs."""
     check_same_configuration(names, manifests)
-    for name, manifest in zip(names, manifests):
-        if manifest.get("selection_fingerprint") is None:
-            raise ValueError(f"{name} does not record which cases it selected, so it cannot be compared with other runs")
-    for name, manifest in zip(names[1:], manifests[1:]):
-        if manifest["selection_fingerprint"] != manifests[0]["selection_fingerprint"]:
+    prints = [_fingerprint(name, manifest, recs) for name, manifest, recs in zip(names, manifests, records)]
+    for name, print_ in zip(names[1:], prints[1:]):
+        if print_ != prints[0]:
             raise ValueError(f"{name} differs from {names[0]} in the cases selected (the split file or dataset changed)")
     result = {}
     for provider in manifests[0]["parameters"]["providers"]:

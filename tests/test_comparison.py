@@ -81,6 +81,21 @@ class SplitRunTests(unittest.TestCase):
                 run_batch(directory, params, ENV, FakeSend(perfect), sleep=lambda s: None)
         self.assertEqual(before, {n: (directory / n).read_bytes() for n in before})
 
+    def test_a_count_only_manifest_with_records_of_other_cases_is_refused_before_anything_changes(self) -> None:
+        directory = Path(tempfile.mkdtemp()) / "out"
+        params = parameters(sample_size=1, categories=("simple_python",), providers=("openai",))
+        run_batch(directory, params, ENV, FakeSend(perfect), sleep=lambda s: None)
+        saved = json.loads((directory / "run.json").read_text())
+        del saved["selection_fingerprint"]  # the shape the preceding commit wrote
+        (directory / "run.json").write_text(json.dumps(saved, indent=2) + "\n")
+        before = {n: (directory / n).read_bytes() for n in ("run.json", "records.jsonl")}
+        other = [c for c in select_cases(("simple_python",), None, 0) if c.case_id not in before["records.jsonl"].decode()][:1]
+        with unittest.mock.patch("benchmark_loop_agent.batch.select_cases", return_value=other):
+            with self.assertRaisesRegex(ValueError, "no longer select"):
+                run_batch(directory, params, ENV, FakeSend(perfect), sleep=lambda s: None)
+        self.assertEqual(before, {n: (directory / n).read_bytes() for n in before})
+        run_batch(directory, params, ENV, FakeSend(perfect), sleep=lambda s: None)  # unchanged selection still resumes
+
     def test_a_run_without_split_saves_no_split_key(self) -> None:
         directory = Path(tempfile.mkdtemp()) / "out"
         run_batch(directory, parameters(sample_size=1), ENV, FakeSend(perfect), sleep=lambda s: None)
@@ -144,6 +159,21 @@ class RepeatTests(unittest.TestCase):
         a, b = fixture_run(set(), selected=()), fixture_run(set(), selected=())
         with self.assertRaisesRegex(ValueError, "r1.*undefined"):
             spreads(["r1", "r2"], [a[0], b[0]], [a[1], b[1]])
+
+    def test_complete_older_runs_are_compared_by_their_recorded_cases(self) -> None:
+        a, b = fixture_run({"a1"}), fixture_run({"a1", "a2"})
+        for m, _ in (a, b):
+            del m["selection_fingerprint"]
+        self.assertEqual(spreads(["r1", "r2"], [a[0], b[0]], [a[1], b[1]])["openai"]["overall"]["runs"], 2)
+        c = fixture_run({"a1"}, selected=("a1", "a2", "a3", "x9"))
+        del c[0]["selection_fingerprint"]
+        with self.assertRaisesRegex(ValueError, "cases selected"):
+            spreads(["r1", "r2"], [a[0], c[0]], [a[1], c[1]])
+        d = fixture_run({"a1"}, selected=("a1", "a2"))  # incomplete: two records for four selected
+        d[0]["selection"] = {"simple_python": 4}
+        del d[0]["selection_fingerprint"]
+        with self.assertRaisesRegex(ValueError, "does not record which cases"):
+            spreads(["r1", "r2"], [a[0], d[0]], [a[1], d[1]])
 
     def test_a_run_with_an_unavailable_figure_is_refused(self) -> None:
         a, b = fixture_run({"a1"}), fixture_run({"a1"}, selection=None)

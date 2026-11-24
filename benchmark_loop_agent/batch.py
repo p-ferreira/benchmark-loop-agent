@@ -79,6 +79,8 @@ def run_batch(
             f"{directory} selected other cases than these parameters select now (the split file or the "
             "dataset changed since); use a new --output-dir"
         )
+    if previous is not None and "selection_fingerprint" not in previous:
+        _refuse_stale_records(directory, {case.case_id for case in cases})
     store = RecordStore(directory)
     finished = store.open_for_resume()
     pending = [(name, case) for case in cases for name in parameters.providers
@@ -122,6 +124,20 @@ def _selected_differently(previous: dict[str, Any], selection: dict[str, int], f
     if "selection_fingerprint" in previous:
         return previous["selection_fingerprint"] != fingerprint
     return isinstance(previous.get("selection"), dict) and previous["selection"] != selection
+
+
+def _refuse_stale_records(directory: Path, selected: set[str]) -> None:
+    """Refuse a count-only manifest whose kept records belong to cases no longer selected.
+
+    Such a manifest cannot say which cases it selected, so equal counts prove
+    nothing; records for other cases would be kept and counted as passes.
+    """
+    stale = sorted({r["case_id"] for r in read_records(directory / "records.jsonl")} - selected)
+    if stale:
+        raise ValueError(
+            f"{directory} holds records for cases these parameters no longer select (e.g. {stale[0]}; the "
+            "split file or the dataset changed since); use a new --output-dir"
+        )
 
 
 def _refuse_credentials_as_models(parameters: RunParameters, environment: Mapping[str, str]) -> None:
