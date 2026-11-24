@@ -11,6 +11,7 @@ from typing import Any, Callable, Mapping, Sequence
 from .dataset import DATASET_REVISION, Case
 from .providers import ProviderError, ProviderResponse, Send, request_anthropic, request_openai
 from .record import Record
+from .tracing import API_KEY_ENV
 from .scoring import SCORER_REVISION, ReferenceDataError, score_calls
 
 MAX_REASON_LENGTH = 500
@@ -62,6 +63,8 @@ def run_provider(
     model = environment.get(provider.model_env) or None
     # Every configured key, not just this provider's: nothing emitted may carry one.
     secrets = [key for p in PROVIDERS.values() if (key := environment.get(p.key_env))]
+    if environment.get(API_KEY_ENV):
+        secrets.append(environment[API_KEY_ENV])
 
     def record(outcome, reasons, *, calls=None, response=None, latency=None) -> Record:
         return redact_record(Record(

@@ -1,0 +1,17 @@
+{
+  "unit": "US dollars per 1 million tokens, standard tier",
+  "models": {
+    "gpt-6-sol": {
+      "input": 2.00,
+      "output": 10.00,
+      "page": "https://developers.openai.com/api/docs/pricing",
+      "read_on": "2026-11-23"
+    },
+    "claude-opus-5-5": {
+      "input": 4.00,
+      "output": 20.00,
+      "page": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "read_on": "2026-11-23"
+    }
+  }
+}

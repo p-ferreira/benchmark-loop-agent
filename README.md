@@ -182,13 +182,98 @@ rejects), no temperature is sent, and Anthropic's `max_tokens` is 4096.
   from the stand-in described above, which exists because BFCL's real
   `model_config.py` imports every supported model SDK.
 
+## Tracing in Phoenix
+
+A run can be traced in [Arize Phoenix](https://arize.com/docs/phoenix) over
+OTLP. Every case of a run appears there as one trace per case and provider.
+The `openai` and `anthropic` requests are recorded by the standard
+OpenInference instrumentation (`openinference-instrumentation-openai` and
+`-anthropic`); this code adds no span for what they already record. It adds
+one parent span, `benchmark_case`, per attempt at a case, so the
+instrumentation's request spans sit inside the case's trace.
+
+Start a local Phoenix, then set the endpoint:
+
+```sh
+docker run -p 6006:6006 -p 4317:4317 arizephoenix/phoenix:latest
+export PHOENIX_COLLECTOR_ENDPOINT=http://localhost:6006
+uv run --locked python -m benchmark_loop_agent --output-dir runs/small --sample-size 4
+```
+
+| Setting | Meaning |
+|---------|---------|
+| `PHOENIX_COLLECTOR_ENDPOINT` | base address of Phoenix; the code appends the OTLP path `/v1/traces`. **Unset: nothing is sent and the run behaves as before** |
+| `PHOENIX_API_KEY` | only for a Phoenix that requires one; sent as a bearer token. Treated like the provider keys: never in a record, log (exporter errors included), error message or trace; every span is scrubbed before export |
+| `PHOENIX_PROJECT_NAME` | Phoenix project the traces go to (default `benchmark-loop-agent`) |
+
+Each `benchmark_case` span carries `benchmark.run_id` (also in `run.json`, and
+kept when a run resumes), `benchmark.case_id`, `benchmark.category`,
+`benchmark.provider`, `benchmark.requested_model`, `benchmark.actual_model`,
+`benchmark.verdict` (`pass`, `fail` or `unscored`), `benchmark.failure_reason`
+and `benchmark.invocation`, and a `metadata` JSON with the same facts. In
+Phoenix, filter for example with
+`metadata["category"] == "irrelevance" and metadata["verdict"] == "fail"`.
+
+* **Each attempt is its own trace.** A case that was `unscored` and passes on a
+  resume has two traces; the first stays `unscored`. Nothing rewrites a trace.
+* **Unscored before any reply** (a missing key, say): the trace has the
+  requested model and the reason; the actual model and the tokens are absent.
+* **The expected answer** is not sent before the model has replied: the
+  case's span starts with the facts above only, and the verdict and reason are
+  added after scoring. A failure reason from the checker can name the expected
+  value; that is sent after the reply.
+* **Best effort.** A failed or slow export never changes a record, a verdict or
+  the exit code. A case whose export failed keeps its record and its trace is
+  **not** sent again on a resume; no unsent trace is kept on disk. Traces of
+  such a case are missing from Phoenix, not queued.
+* Exports are sent in batches with a 5 second request timeout, and the end of
+  a run waits at most 10 seconds to send what is queued.
+
+## Report
+
+One Markdown file per model, built only from the run directory
+(`records.jsonl`, `run.json`) and the rates file, never from Phoenix, so it can
+be regenerated at any time:
+
+```sh
+uv run --locked python -m benchmark_loop_agent.report runs/full [--output-dir DIR] [--rates FILE]
+```
+
+The files are named `report-<provider>-<model>.md` and go to the run
+directory unless `--output-dir` says otherwise. A report holds:
+
+* accuracy per category and overall, with pass, fail and unscored counts.
+  Accuracy is pass / (pass + fail); unscored cases were not judged. **Overall**
+  pools every judged case, so each case counts once and a larger category
+  weighs more; it is not the mean of the category figures;
+* input and output tokens, and the cases without reported usage, counted and
+  named (their tokens are not estimated);
+* cost, from `data/rates.json`: input and output tokens at the rate of the
+  requested model. Each entry has the price (US dollars per 1 million tokens,
+  standard tier), the address of the provider's pricing page and the date it
+  was read; prices are copied from those pages, not from memory. A model with
+  no entry gets no cost, and the report says so. Both providers price cached
+  input lower and the records do not separate it, so the cost counts all input
+  at the uncached rate and can overstate what was charged;
+* wall time and concurrency of every invocation, from the start and end times
+  saved in `run.json`. An invocation with no end time (interrupted) is shown
+  as unavailable and no total is given; nothing is derived from case latencies.
+  The wall time is that of the run, shared by all its providers;
+* the requested and actual model, dataset and scorer revisions, and the run's
+  parameters;
+* a note at the top if the run was sampled (`--sample-size`) or is incomplete
+  (unscored cases, a category with fewer records than the run selected for it
+  (the selection size is saved in `run.json`), or a last invocation that never
+  ended). A record with only one token count still contributes that count; cases
+  missing either are all named, with the missing one.
+
 ## Tests
 
 Offline: no network and no API keys. The test setup makes any connection
-attempt fail.
+attempt fail, except to the tests' own stand-in OTLP receiver on 127.0.0.1.
 
 ```sh
-env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY uv run --locked python -m unittest discover -s tests -v
+env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u PHOENIX_API_KEY -u PHOENIX_COLLECTOR_ENDPOINT uv run --locked python -m unittest discover -s tests -v
 ```
 
 ## Licence

@@ -9,14 +9,42 @@ from benchmark_loop_agent.dataset import Case, load_cases, load_expected_answers
 SECRET = "sk-test-SECRET-123"
 
 
+# Ports of the stand-in receivers (tests/receiver.py) started by the running tests:
+# the only place a test may connect to, and only on the loopback address.
+ALLOWED_LOCAL_PORTS: set[int] = set()
+_connect, _create_connection, _getaddrinfo = socket.socket.connect, socket.create_connection, socket.getaddrinfo
+
+
 def _refuse(*args: Any, **kwargs: Any) -> None:
     raise AssertionError("tests must not touch the network")
 
 
+def _allowed(host: Any, port: Any) -> bool:
+    return host == "127.0.0.1" and port in ALLOWED_LOCAL_PORTS
+
+
+def _guarded_connect(self: socket.socket, address: Any) -> Any:
+    if isinstance(address, tuple) and _allowed(address[0], address[1]):
+        return _connect(self, address)
+    _refuse()
+
+
+def _guarded_create_connection(address: Any, *args: Any, **kwargs: Any) -> Any:
+    if _allowed(address[0], address[1]):
+        return _create_connection(address, *args, **kwargs)
+    _refuse()
+
+
+def _guarded_getaddrinfo(host: Any, port: Any, *args: Any, **kwargs: Any) -> Any:
+    if _allowed(host, int(port) if port is not None else None):
+        return _getaddrinfo(host, port, *args, **kwargs)
+    _refuse()
+
+
 # A test that tried a live call fails here instead of passing by luck.
-socket.socket.connect = _refuse  # type: ignore[method-assign]
-socket.create_connection = _refuse  # type: ignore[assignment]
-socket.getaddrinfo = _refuse  # type: ignore[assignment]
+socket.socket.connect = _guarded_connect  # type: ignore[method-assign]
+socket.create_connection = _guarded_create_connection  # type: ignore[assignment]
+socket.getaddrinfo = _guarded_getaddrinfo  # type: ignore[assignment]
 
 
 def environment(*providers: str) -> dict[str, str]:
