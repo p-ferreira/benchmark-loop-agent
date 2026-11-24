@@ -10,21 +10,21 @@ library is a plain function (``Send``) so tests can replace it.
 """
 
 import json
-from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import anthropic
 import openai
 
-from .case import PinnedCase
+from .dataset import Case
 from .scoring import BfclCall
+from .tools import convert_to_tool, with_language_handling
 
 # (provider name, API key, request arguments) -> the reply as a plain dict.
 Send = Callable[[str, str, dict[str, Any]], dict[str, Any]]
 
 REQUEST_TIMEOUT_SECONDS = 120
-ANTHROPIC_MAX_TOKENS = 1024  # required by the Messages API; ample for one tool call
+ANTHROPIC_MAX_TOKENS = 4096  # required by the Messages API; room for several parallel calls
 
 
 MAX_ARGUMENT_DEPTH = 50  # far deeper than any real function schema; bounds every later recursion
@@ -69,6 +69,19 @@ class ProviderResponse:
     # and raw arguments for the reader. They never reach the BFCL checker.
     malformed: list[str] = field(default_factory=list)
     unscorable_calls: list[dict[str, Any]] = field(default_factory=list)
+    # Calls whose arguments decode as a JSON object but nest deeper than our record
+    # safeguard allows. They are scored by BFCL like any other call (the safeguard
+    # never decides a grade); only the record keeps the bounded text in
+    # ``unscorable_calls`` instead of the decoded object.
+    deep_calls: list[BfclCall] = field(default_factory=list)
+    # Every tool call as the record shows it (the decoded call, or the entry kept in
+    # ``unscorable_calls``), in the order the provider returned them. Empty means
+    # the adapter did not track order: the record then lists ``calls`` first.
+    record_calls: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def calls_for_record(self) -> list[dict[str, Any]]:
+        return self.record_calls or self.calls + self.unscorable_calls
 
 
 def send_request(
@@ -78,62 +91,52 @@ def send_request(
 
     A failed call raises the library's own exception. The runner turns any
     exception into an "unscored" record and redacts keys from its text.
+    The libraries' own retrying is switched off: ``retry.py`` retries a bounded
+    number of times, so the total number of attempts is known.
     ``http_client`` (the libraries' own HTTP client type) lets the tests answer
     the request without a network.
     """
     if provider == "openai":
-        client = openai.OpenAI(api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, http_client=http_client)
+        client = openai.OpenAI(api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, max_retries=0, http_client=http_client)
         return client.responses.create(**request).to_dict()
     if provider == "anthropic":
-        client = anthropic.Anthropic(api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, http_client=http_client)
+        client = anthropic.Anthropic(api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, max_retries=0, http_client=http_client)
         return client.messages.create(**request).to_dict()
     raise ProviderError(f"unknown provider: {provider}")
 
 
-def json_schema_parameters(bfcl_parameters: dict[str, Any]) -> dict[str, Any]:
-    """Turn a BFCL parameter schema into JSON Schema.
-
-    BFCL writes the top-level type as "dict"; both providers require "object".
-    The pinned case uses only JSON Schema types below that level, so nothing
-    else needs translating.
-    """
-    schema = deepcopy(bfcl_parameters)
-    if schema.get("type") == "dict":
-        schema["type"] = "object"
-    return schema
-
-
-def request_openai(api_key: str, model: str, case: PinnedCase, send: Send) -> ProviderResponse:
-    """Call the OpenAI Responses API with the case's function as a tool."""
+def openai_request(model: str, case: Case) -> dict[str, Any]:
+    """The Responses API request for ``case``, built the way BFCL's OpenAI handler builds it."""
     # The Responses API is used because OpenAI's current reasoning models refuse
-    # function tools on the older Chat Completions endpoint. Its tools are flat
-    # ({"type": "function", "name": ...}) with the schema under "parameters".
-    # Anthropic differs; see request_anthropic.
-    tools = [
-        {
-            "type": "function",
-            "name": f["name"],
-            "description": f["description"],
-            "parameters": json_schema_parameters(f["parameters"]),
-            # Strict mode would require every parameter to be listed as required.
-            # BFCL schemas have optional parameters, so the schema is sent as written.
-            "strict": False,
-        }
-        for f in case.functions
-    ]
-    request = {
+    # function tools on the older Chat Completions endpoint.
+    tools = convert_to_tool(with_language_handling(case.functions, case.category), "openai-responses")
+    for tool in tools:
+        # Strict mode would require every parameter to be listed as required.
+        # BFCL schemas have optional parameters, so the schema is sent as written.
+        tool["strict"] = False
+    # BFCL replaces the "system" role with "developer" for OpenAI.
+    messages = [{**m, "role": "developer" if m["role"] == "system" else m["role"]} for m in case.messages]
+    request: dict[str, Any] = {
         "model": model,
-        "input": [{"role": "user", "content": case.prompt}],
-        "tools": tools,
+        "input": messages,
         "store": False,  # a benchmark request has no reason to be kept by the provider
     }
-    reply = send("openai", api_key, request)
+    if tools:  # BFCL leaves "tools" out when a case has no functions
+        request["tools"] = tools
+    return request
+
+
+def request_openai(api_key: str, model: str, case: Case, send: Send) -> ProviderResponse:
+    """Call the OpenAI Responses API with the case's functions as tools."""
+    reply = send("openai", api_key, openai_request(model, case))
 
     try:
         usage = reply.get("usage") or {}
         calls: list[BfclCall] = []
         malformed: list[str] = []
+        deep: list[BfclCall] = []
         unscorable: list[dict[str, Any]] = []
+        ordered: list[dict[str, Any]] = []
         # The reply's "output" list mixes item types (reasoning, text, tool calls).
         # Only "function_call" items are tool calls.
         for item in reply["output"]:
@@ -149,61 +152,82 @@ def request_openai(api_key: str, model: str, case: PinnedCase, send: Send) -> Pr
                 # limit; RecursionError covers absurdly deep nesting.
                 malformed.append(f"arguments for {name} are not valid JSON")
                 unscorable.append({name: raw_arguments})
+                ordered.append(unscorable[-1])
                 continue
             if not isinstance(arguments, dict):
                 malformed.append(f"arguments for {name} are not a JSON object")
                 unscorable.append({name: raw_arguments})
+                ordered.append(unscorable[-1])
                 continue
             if too_deep(arguments):
-                malformed.append(f"arguments for {name} are nested too deeply")
+                deep.append({name: arguments})
                 unscorable.append({name: raw_arguments})
+                ordered.append(unscorable[-1])
                 continue
             calls.append({name: arguments})
+            ordered.append(calls[-1])
         return ProviderResponse(
-            reply.get("model"), calls, usage.get("input_tokens"), usage.get("output_tokens"), malformed, unscorable
+            reply.get("model"), calls, usage.get("input_tokens"), usage.get("output_tokens"), malformed, unscorable, deep, ordered
         )
     except (KeyError, IndexError, TypeError) as error:
         raise ProviderError(f"unexpected OpenAI response shape: {type(error).__name__}: {error}") from None
 
 
-def request_anthropic(api_key: str, model: str, case: PinnedCase, send: Send) -> ProviderResponse:
-    """Call Anthropic Messages with the case's function as a tool."""
-    # Anthropic tools are flat, name the schema "input_schema", and require max_tokens.
-    tools = [
-        {
-            "name": f["name"],
-            "description": f["description"],
-            "input_schema": json_schema_parameters(f["parameters"]),
-        }
-        for f in case.functions
-    ]
-    request = {
-        "model": model,
-        "max_tokens": ANTHROPIC_MAX_TOKENS,
-        "messages": [{"role": "user", "content": case.prompt}],
-        "tools": tools,
-    }
-    reply = send("anthropic", api_key, request)
+def anthropic_request(model: str, case: Case) -> dict[str, Any]:
+    """The Messages request for ``case``, built the way BFCL's Claude handler builds it."""
+    # BFCL moves the system message into the "system" field and merges
+    # consecutive user messages, which the Messages API requires.
+    messages: list[dict[str, str]] = []
+    system: str | None = None
+    for message in case.messages:
+        if message["role"] == "system" and system is None:
+            system = message["content"]
+        elif message["role"] == "user" and messages and messages[-1]["role"] == "user":
+            messages[-1] = {**messages[-1], "content": messages[-1]["content"] + "\n\n" + message["content"]}
+        else:
+            messages.append(dict(message))
+    request: dict[str, Any] = {"model": model, "max_tokens": ANTHROPIC_MAX_TOKENS, "messages": messages}
+    tools = convert_to_tool(with_language_handling(case.functions, case.category), "claude")
+    if tools:
+        request["tools"] = tools
+    if system is not None:
+        request["system"] = [{"type": "text", "text": system}]
+    return request
+
+
+def request_anthropic(api_key: str, model: str, case: Case, send: Send) -> ProviderResponse:
+    """Call Anthropic Messages with the case's functions as tools."""
+    reply = send("anthropic", api_key, anthropic_request(model, case))
 
     try:
         usage = reply.get("usage") or {}
         # Tool calls are "tool_use" blocks in the content list; "input" is already a dict.
         calls: list[BfclCall] = []
         malformed: list[str] = []
+        deep: list[BfclCall] = []
         unscorable: list[dict[str, Any]] = []
+        ordered: list[dict[str, Any]] = []
         for block in reply["content"]:
             if block["type"] != "tool_use":
                 continue
             if too_deep(block["input"]):  # lists too: deep non-objects must not reach recursive redaction
-                malformed.append(f"input for {block['name']} is nested too deeply")
+                # A deep object still decoded (a call for BFCL's presence rule);
+                # a deep non-object is not a call at all.
+                if isinstance(block["input"], dict):
+                    deep.append({block["name"]: block["input"]})
+                else:
+                    malformed.append(f"input for {block['name']} is nested too deeply")
                 unscorable.append({block["name"]: printable_text(block["input"])})
+                ordered.append(unscorable[-1])
             elif isinstance(block["input"], dict):
                 calls.append({block["name"]: block["input"]})
+                ordered.append(calls[-1])
             else:
                 malformed.append(f"input for {block['name']} is not a JSON object")
                 unscorable.append({block["name"]: block["input"]})
+                ordered.append(unscorable[-1])
         return ProviderResponse(
-            reply.get("model"), calls, usage.get("input_tokens"), usage.get("output_tokens"), malformed, unscorable
+            reply.get("model"), calls, usage.get("input_tokens"), usage.get("output_tokens"), malformed, unscorable, deep, ordered
         )
     except (KeyError, TypeError) as error:
         raise ProviderError(f"unexpected Anthropic response shape: {type(error).__name__}: {error}") from None

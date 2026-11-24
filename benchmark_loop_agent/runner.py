@@ -1,17 +1,17 @@
-"""Run the pinned case against selected providers and build one record each.
+"""Run one case against one provider and build its record.
 
-Each provider runs inside its own ``try`` block, so one provider's failure can
-never prevent or change another's record.
+``run_provider`` never raises, and it shares nothing between calls, so one
+case's or one provider's failure cannot prevent or change another's record.
 """
 
 import time
 from dataclasses import dataclass, fields
 from typing import Any, Callable, Mapping, Sequence
 
-from .case import DATASET_REVISION, PinnedCase, load_expected_answer
+from .dataset import DATASET_REVISION, Case
 from .providers import ProviderError, ProviderResponse, Send, request_anthropic, request_openai
 from .record import Record
-from .scoring import SCORER_REVISION, score_calls
+from .scoring import SCORER_REVISION, ReferenceDataError, score_calls
 
 MAX_REASON_LENGTH = 500
 
@@ -22,7 +22,7 @@ class Provider:
 
     key_env: str
     model_env: str
-    request: Callable[[str, str, PinnedCase, Send], ProviderResponse]
+    request: Callable[[str, str, Case, Send], ProviderResponse]
 
 
 PROVIDERS: dict[str, Provider] = {
@@ -54,7 +54,7 @@ def redact_record(record: Record, secrets: Sequence[str]) -> Record:
 
 
 def run_provider(
-    name: str, case: PinnedCase, environment: Mapping[str, str], send: Send
+    name: str, case: Case, environment: Mapping[str, str], send: Send
 ) -> Record:
     """Run the case against one provider and return its record. Never raises."""
     provider = PROVIDERS[name]
@@ -69,6 +69,7 @@ def run_provider(
             requested_model=model,
             actual_model=response.actual_model if response else None,
             case_id=case.case_id,
+            category=case.category,
             dataset_revision=DATASET_REVISION,
             scorer_revision=SCORER_REVISION,
             returned_calls=calls,
@@ -92,28 +93,25 @@ def run_provider(
         return record("unscored", [f"{type(error).__name__}: {error}"], latency=time.perf_counter() - started)
     latency = time.perf_counter() - started
 
-    if response.malformed:
-        return record(
-            "fail",
-            response.malformed,
-            calls=response.calls + response.unscorable_calls,
-            response=response,
-            latency=latency,
-        )
-    # The expected answer is read here, after the model has answered, and goes
-    # nowhere but the scorer.
-    verdict = score_calls(case, response.calls, load_expected_answer(), model)
+    # Scoring is the only step that reads expected answers, and it runs after
+    # the model has answered.
+    try:
+        verdict = score_calls(case, response.calls, response.malformed, response.deep_calls)
+    except ReferenceDataError as error:
+        # Our data is unreadable, not the model wrong: unscored, so a resume retries it.
+        return record("unscored", [str(error)], calls=response.calls_for_record,
+                      response=response, latency=latency)
+    except Exception as error:
+        # The response arrived but the checker could not judge it (for example a
+        # value of a type it does not expect), so it is a wrong answer, and the
+        # reason says what happened. It must not stop the run.
+        return record("fail", [f"scorer raised {type(error).__name__}: {error}"],
+                      calls=response.calls_for_record, response=response, latency=latency)
     return record(
         "pass" if verdict.passed else "fail",
         verdict.reasons,
-        calls=response.calls,
+        calls=response.calls_for_record,
         response=response,
         latency=latency,
     )
 
-
-def run_providers(
-    names: Sequence[str], case: PinnedCase, environment: Mapping[str, str], send: Send
-) -> list[Record]:
-    """Run the case once per named provider, in order."""
-    return [run_provider(name, case, environment, send) for name in names]

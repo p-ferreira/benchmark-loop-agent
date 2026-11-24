@@ -1,1 +1,1 @@
-"""Run one pinned BFCL case through OpenAI and Anthropic and score the tool calls."""
+"""Run single-turn BFCL cases through OpenAI and Anthropic and score the tool calls with BFCL's checker."""
