@@ -1,4 +1,4 @@
-"""The machine-readable record emitted for each provider."""
+"""The machine-readable record written for each case and provider."""
 
 import math
 from dataclasses import asdict, dataclass
@@ -14,12 +14,13 @@ Outcome = Literal["pass", "fail", "unscored"]
 
 @dataclass(frozen=True)
 class Record:
-    """One provider's result for the pinned case."""
+    """One provider's result for one case."""
 
     provider: str
     requested_model: str | None
     actual_model: str | None  # as reported by the response; None if there was none
     case_id: str
+    category: str
     dataset_revision: str
     scorer_revision: str
     returned_calls: list[BfclCall] | None  # None when unscored

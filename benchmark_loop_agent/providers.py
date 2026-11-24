@@ -10,21 +10,21 @@ library is a plain function (``Send``) so tests can replace it.
 """
 
 import json
-from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import anthropic
 import openai
 
-from .case import PinnedCase
+from .dataset import Case
 from .scoring import BfclCall
+from .tools import convert_to_tool, with_language_handling
 
 # (provider name, API key, request arguments) -> the reply as a plain dict.
 Send = Callable[[str, str, dict[str, Any]], dict[str, Any]]
 
 REQUEST_TIMEOUT_SECONDS = 120
-ANTHROPIC_MAX_TOKENS = 1024  # required by the Messages API; ample for one tool call
+ANTHROPIC_MAX_TOKENS = 4096  # required by the Messages API; room for several parallel calls
 
 
 MAX_ARGUMENT_DEPTH = 50  # far deeper than any real function schema; bounds every later recursion
@@ -78,56 +78,44 @@ def send_request(
 
     A failed call raises the library's own exception. The runner turns any
     exception into an "unscored" record and redacts keys from its text.
+    The libraries' own retrying is switched off: ``retry.py`` retries a bounded
+    number of times, so the total number of attempts is known.
     ``http_client`` (the libraries' own HTTP client type) lets the tests answer
     the request without a network.
     """
     if provider == "openai":
-        client = openai.OpenAI(api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, http_client=http_client)
+        client = openai.OpenAI(api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, max_retries=0, http_client=http_client)
         return client.responses.create(**request).to_dict()
     if provider == "anthropic":
-        client = anthropic.Anthropic(api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, http_client=http_client)
+        client = anthropic.Anthropic(api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, max_retries=0, http_client=http_client)
         return client.messages.create(**request).to_dict()
     raise ProviderError(f"unknown provider: {provider}")
 
 
-def json_schema_parameters(bfcl_parameters: dict[str, Any]) -> dict[str, Any]:
-    """Turn a BFCL parameter schema into JSON Schema.
-
-    BFCL writes the top-level type as "dict"; both providers require "object".
-    The pinned case uses only JSON Schema types below that level, so nothing
-    else needs translating.
-    """
-    schema = deepcopy(bfcl_parameters)
-    if schema.get("type") == "dict":
-        schema["type"] = "object"
-    return schema
-
-
-def request_openai(api_key: str, model: str, case: PinnedCase, send: Send) -> ProviderResponse:
-    """Call the OpenAI Responses API with the case's function as a tool."""
+def openai_request(model: str, case: Case) -> dict[str, Any]:
+    """The Responses API request for ``case``, built the way BFCL's OpenAI handler builds it."""
     # The Responses API is used because OpenAI's current reasoning models refuse
-    # function tools on the older Chat Completions endpoint. Its tools are flat
-    # ({"type": "function", "name": ...}) with the schema under "parameters".
-    # Anthropic differs; see request_anthropic.
-    tools = [
-        {
-            "type": "function",
-            "name": f["name"],
-            "description": f["description"],
-            "parameters": json_schema_parameters(f["parameters"]),
-            # Strict mode would require every parameter to be listed as required.
-            # BFCL schemas have optional parameters, so the schema is sent as written.
-            "strict": False,
-        }
-        for f in case.functions
-    ]
-    request = {
+    # function tools on the older Chat Completions endpoint.
+    tools = convert_to_tool(with_language_handling(case.functions, case.category), "openai-responses")
+    for tool in tools:
+        # Strict mode would require every parameter to be listed as required.
+        # BFCL schemas have optional parameters, so the schema is sent as written.
+        tool["strict"] = False
+    # BFCL replaces the "system" role with "developer" for OpenAI.
+    messages = [{**m, "role": "developer" if m["role"] == "system" else m["role"]} for m in case.messages]
+    request: dict[str, Any] = {
         "model": model,
-        "input": [{"role": "user", "content": case.prompt}],
-        "tools": tools,
+        "input": messages,
         "store": False,  # a benchmark request has no reason to be kept by the provider
     }
-    reply = send("openai", api_key, request)
+    if tools:  # BFCL leaves "tools" out when a case has no functions
+        request["tools"] = tools
+    return request
+
+
+def request_openai(api_key: str, model: str, case: Case, send: Send) -> ProviderResponse:
+    """Call the OpenAI Responses API with the case's functions as tools."""
+    reply = send("openai", api_key, openai_request(model, case))
 
     try:
         usage = reply.get("usage") or {}
@@ -166,24 +154,31 @@ def request_openai(api_key: str, model: str, case: PinnedCase, send: Send) -> Pr
         raise ProviderError(f"unexpected OpenAI response shape: {type(error).__name__}: {error}") from None
 
 
-def request_anthropic(api_key: str, model: str, case: PinnedCase, send: Send) -> ProviderResponse:
-    """Call Anthropic Messages with the case's function as a tool."""
-    # Anthropic tools are flat, name the schema "input_schema", and require max_tokens.
-    tools = [
-        {
-            "name": f["name"],
-            "description": f["description"],
-            "input_schema": json_schema_parameters(f["parameters"]),
-        }
-        for f in case.functions
-    ]
-    request = {
-        "model": model,
-        "max_tokens": ANTHROPIC_MAX_TOKENS,
-        "messages": [{"role": "user", "content": case.prompt}],
-        "tools": tools,
-    }
-    reply = send("anthropic", api_key, request)
+def anthropic_request(model: str, case: Case) -> dict[str, Any]:
+    """The Messages request for ``case``, built the way BFCL's Claude handler builds it."""
+    # BFCL moves the system message into the "system" field and merges
+    # consecutive user messages, which the Messages API requires.
+    messages: list[dict[str, str]] = []
+    system: str | None = None
+    for message in case.messages:
+        if message["role"] == "system" and system is None:
+            system = message["content"]
+        elif message["role"] == "user" and messages and messages[-1]["role"] == "user":
+            messages[-1] = {**messages[-1], "content": messages[-1]["content"] + "\n\n" + message["content"]}
+        else:
+            messages.append(dict(message))
+    request: dict[str, Any] = {"model": model, "max_tokens": ANTHROPIC_MAX_TOKENS, "messages": messages}
+    tools = convert_to_tool(with_language_handling(case.functions, case.category), "claude")
+    if tools:
+        request["tools"] = tools
+    if system is not None:
+        request["system"] = [{"type": "text", "text": system}]
+    return request
+
+
+def request_anthropic(api_key: str, model: str, case: Case, send: Send) -> ProviderResponse:
+    """Call Anthropic Messages with the case's functions as tools."""
+    reply = send("anthropic", api_key, anthropic_request(model, case))
 
     try:
         usage = reply.get("usage") or {}

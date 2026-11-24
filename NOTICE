@@ -13,9 +13,13 @@ under berkeley-function-call-leaderboard/:
   bfcl_eval/eval_checker/ast_eval/ast_checker.py
   bfcl_eval/eval_checker/ast_eval/type_convertor/java_type_converter.py
   bfcl_eval/eval_checker/ast_eval/type_convertor/js_type_converter.py
-  bfcl_eval/data/BFCL_v4_simple_python.json            (entry "simple_python_0" -> data/simple_python_0.case.json)
-  bfcl_eval/data/possible_answer/BFCL_v4_simple_python.json (entry "simple_python_0" -> data/simple_python_0.answer.json)
-The two data files hold the single entry with that id, unchanged.
+  bfcl_eval/data/BFCL_v4_<category>.json                 -> data/questions/  (all 13 single-turn categories)
+  bfcl_eval/data/possible_answer/BFCL_v4_<category>.json -> data/answers/    (the 10 categories that have one;
+                                                              irrelevance, live_irrelevance and live_relevance have none)
+The data files are unchanged. <category> is each of: simple_python, simple_java,
+simple_javascript, multiple, parallel, parallel_multiple, irrelevance,
+live_simple, live_multiple, live_parallel, live_parallel_multiple,
+live_irrelevance, live_relevance.
 
 Not copied from BFCL: vendor/bfcl_eval/constants/model_config.py is a small
 stand-in written for this repository (see the docstring in that file).

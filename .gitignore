@@ -11,3 +11,6 @@ __pycache__/
 .env
 .env.*
 *.key
+
+# Run output (records and manifests)
+runs/
