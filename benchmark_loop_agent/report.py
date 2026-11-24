@@ -5,6 +5,7 @@ file. It never reads Phoenix, the dataset or the network, so a report can be
 regenerated at any time.
 
     python -m benchmark_loop_agent.report RUN_DIR [--rates FILE] [--output-dir DIR]
+    python -m benchmark_loop_agent.report RUN_DIR RUN_DIR ... --output-dir DIR   # spread over repeated runs
 """
 
 import argparse
@@ -15,7 +16,9 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Sequence
 
+from .comparison import OVERALL, UNAVAILABLE, comparison_counts, format_figure
 from .dataset import DATA_DIR
+from .repeats import render_spread, spreads
 from .store import MANIFEST_FILE, RECORDS_FILE, read_manifest, read_records
 
 RATES_FILE = DATA_DIR / "rates.json"
@@ -53,6 +56,29 @@ def wall_time(sessions: list[dict[str, Any]], legacy_concurrency: Any = None) ->
     return total, lines
 
 
+def comparison_section(manifest: dict[str, Any], provider: str, records: list[dict[str, Any]]) -> list[str]:
+    """The comparison figure per category and overall, beside (not instead of) accuracy."""
+    out = ["## Comparison figure", "",
+           "Passes divided by the cases the run selected, as `run.json` records them. Unscored cases and "
+           "selected cases with no record stay in the denominator, so both count against the figure.", ""]
+    counts = comparison_counts(manifest, records, provider)
+    if counts is None:
+        return out + [f"Comparison figure: {UNAVAILABLE}. This run's `run.json` does not record the cases it "
+                      "selected, and a figure computed from the records present would leave out any missing case.", ""]
+    mine = [r for r in records if r["provider"] == provider]
+    out += ["| Category | Comparison figure | Selected | Pass | Fail | Unscored | No record |",
+            "| --- | --- | --- | --- | --- | --- | --- |"]
+    totals = [0, 0, 0]
+    for key, (passed, selected) in counts.items():
+        subset = mine if key == OVERALL else [r for r in mine if r["category"] == key]
+        failed, unscored = (sum(1 for r in subset if r["outcome"] == o) for o in ("fail", "unscored"))
+        missing = selected - passed - failed - unscored
+        label, bold = ("Overall", "**") if key == OVERALL else (f"`{key}`", "")
+        out.append(f"| {bold}{label}{bold} | "
+                   f"{bold}{format_figure(passed, selected)}{bold} | {selected} | {passed} | {failed} | {unscored} | {missing} |")
+    return out + [""]
+
+
 def render(manifest: dict[str, Any], provider: str, records: list[dict[str, Any]],
            rates: dict[str, dict[str, Any]]) -> str:
     params = manifest["parameters"]
@@ -84,7 +110,10 @@ def render(manifest: dict[str, Any], provider: str, records: list[dict[str, Any]
     if sessions and max(sessions, key=lambda s: s["number"]).get("ended_at") is None:
         problems.append("the latest invocation has no saved end time")
 
+    split = params.get("split")
     out = [f"# Benchmark report: `{requested or 'model not set'}` ({provider})", ""]
+    if split:
+        out += [f"> **Part: `{split}`.** This run selected only the cases of the {split} part of the split.", ""]
     if sampled:
         if selection is None:
             sizes = f"at most {cap} case(s) per category (actual sizes not recorded)"
@@ -110,6 +139,8 @@ def render(manifest: dict[str, Any], provider: str, records: list[dict[str, Any]
         c = Counter(r["outcome"] for r in mine if r["category"] == category)
         out.append(f"| `{category}` | {accuracy(c['pass'], c['fail'])} | {c['pass']} | {c['fail']} | {c['unscored']} |")
     out += [f"| **Overall** | **{accuracy(counts['pass'], counts['fail'])}** | {counts['pass']} | {counts['fail']} | {counts['unscored']} |", ""]
+
+    out += comparison_section(manifest, provider, records)
 
     # Each known count is summed on its own; a record with only one of them still counts that one.
     in_tokens = sum(r["input_tokens"] for r in mine if r["input_tokens"] is not None)
@@ -151,6 +182,7 @@ def render(manifest: dict[str, Any], provider: str, records: list[dict[str, Any]
             f"* Categories: {', '.join(f'`{c}`' for c in params['categories'])}",
             f"* Sample size per category: {f'at most {cap}' if sampled else 'all cases'}",
             f"* Seed: {params['seed']}",
+            f"* Split part: {split or 'none, every case of the categories'}",
             f"* Providers in the run: {', '.join(params['providers'])}", ""]
     return "\n".join(out)
 
@@ -174,15 +206,42 @@ def build_reports(run_dir: Path, rates_path: Path, output_dir: Path) -> list[Pat
     return written
 
 
+def build_repeated_report(run_dirs: Sequence[Path], output_dir: Path) -> list[Path]:
+    """One spread report per provider over runs of one configuration; refuses anything else."""
+    manifests = []
+    for run_dir in run_dirs:
+        manifest = read_manifest(run_dir)
+        if manifest is None:
+            raise ValueError(f"{run_dir / MANIFEST_FILE} not found: not a run directory")
+        manifests.append(manifest)
+    names = [str(d) for d in run_dirs]
+    table = spreads(names, manifests, [read_records(d / RECORDS_FILE) for d in run_dirs])
+    params = manifests[0]["parameters"]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for provider, rows in table.items():
+        model = params["models"].get(provider)
+        path = output_dir / file_name(provider, model).replace("report-", "repeated-", 1)
+        path.write_text(render_spread(provider, model, params.get("split"), names, rows))
+        written.append(path)
+    return written
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="benchmark_loop_agent.report",
                                      description="Write one Markdown report per model from a run directory.")
-    parser.add_argument("run_dir", type=Path, help="the --output-dir of a finished run")
+    parser.add_argument("run_dirs", type=Path, nargs="+", metavar="RUN_DIR",
+                        help="the --output-dir of a finished run; several of one configuration give the spread of the comparison figure")
     parser.add_argument("--rates", type=Path, default=RATES_FILE, help="rates file (default: data/rates.json)")
     parser.add_argument("--output-dir", type=Path, default=None, help="where the reports go (default: the run directory)")
     args = parser.parse_args(argv)
     try:
-        paths = build_reports(args.run_dir, args.rates, args.output_dir or args.run_dir)
+        if len(args.run_dirs) == 1:
+            paths = build_reports(args.run_dirs[0], args.rates, args.output_dir or args.run_dirs[0])
+        elif args.output_dir is None:
+            parser.error("--output-dir is required with several run directories")
+        else:
+            paths = build_repeated_report(args.run_dirs, args.output_dir)
     except (ValueError, OSError, KeyError) as error:
         parser.error(f"{type(error).__name__}: {error}")
     for path in paths:

@@ -15,7 +15,7 @@ from .runner import PROVIDERS, run_provider
 from .sampling import select_cases
 from .providers import Send
 from .tracing import API_KEY_ENV, Tracing
-from .store import RecordStore, migrate_legacy_concurrency, now, read_manifest, read_records, write_manifest
+from .store import RecordStore, migrate_legacy_concurrency, now, read_manifest, read_records, selection_fingerprint, write_manifest
 
 
 @dataclass(frozen=True)
@@ -28,11 +28,14 @@ class RunParameters:
     providers: tuple[str, ...]
     models: dict[str, str | None]  # requested model ID per provider (no default in code)
     concurrency: int
+    split: str | None = None  # a part of the split file; None means every case
 
     def identity(self) -> dict[str, Any]:
         """The parameters a resumed run must repeat (concurrency may change; each session records its own)."""
         data = asdict(self)
         del data["concurrency"]
+        if data["split"] is None:  # a run without a part is saved as before, so earlier runs still resume
+            del data["split"]
         return data
 
 
@@ -64,10 +67,20 @@ def run_batch(
         if saved != _jsonable(parameters.identity()):
             raise ValueError(
                 f"{directory} holds a run with different parameters; use a new --output-dir "
-                "or repeat the original categories, sample size, seed, providers and models"
+                "or repeat the original categories, sample size, seed, split part, providers and models"
             )
 
-    cases = select_cases(parameters.categories, parameters.sample_size, parameters.seed)
+    cases = select_cases(parameters.categories, parameters.sample_size, parameters.seed, parameters.split)
+    selection = dict(Counter(case.category for case in cases))
+    selection = {category: selection.get(category, 0) for category in parameters.categories}
+    fingerprint = selection_fingerprint(case.case_id for case in cases)
+    if previous is not None and _selected_differently(previous, selection, fingerprint):
+        raise ValueError(
+            f"{directory} selected other cases than these parameters select now (the split file or the "
+            "dataset changed since); use a new --output-dir"
+        )
+    if previous is not None and "selection_fingerprint" not in previous:
+        _refuse_stale_records(directory, {case.case_id for case in cases})
     store = RecordStore(directory)
     finished = store.open_for_resume()
     pending = [(name, case) for case in cases for name in parameters.providers
@@ -77,9 +90,7 @@ def run_batch(
     run_id = (previous or {}).get("run_id") or uuid.uuid4().hex
     tracing = tracing_for(run_id) if tracing_for else None
     session: dict[str, Any] = {"number": number, "concurrency": parameters.concurrency, "started_at": now(), "ended_at": None, "wall_seconds": None}
-    selection = dict(Counter(case.category for case in cases))
-    selection = {category: selection.get(category, 0) for category in parameters.categories}
-    write_manifest(directory, parameters.identity(), session, run_id, selection)
+    write_manifest(directory, parameters.identity(), session, run_id, selection, fingerprint)
     started = time.perf_counter()
     retrying = with_retries(send, sleep=sleep)
 
@@ -106,6 +117,27 @@ def run_batch(
         if tracing is not None:
             tracing.shutdown()
     return new_records + _kept(directory, cases, parameters.providers, {(r.provider, r.case_id) for r in new_records})
+
+
+def _selected_differently(previous: dict[str, Any], selection: dict[str, int], fingerprint: str) -> bool:
+    """Whether the saved run selected other cases; a run that recorded no selection cannot be checked."""
+    if "selection_fingerprint" in previous:
+        return previous["selection_fingerprint"] != fingerprint
+    return isinstance(previous.get("selection"), dict) and previous["selection"] != selection
+
+
+def _refuse_stale_records(directory: Path, selected: set[str]) -> None:
+    """Refuse a count-only manifest whose kept records belong to cases no longer selected.
+
+    Such a manifest cannot say which cases it selected, so equal counts prove
+    nothing; records for other cases would be kept and counted as passes.
+    """
+    stale = sorted({r["case_id"] for r in read_records(directory / "records.jsonl")} - selected)
+    if stale:
+        raise ValueError(
+            f"{directory} holds records for cases these parameters no longer select (e.g. {stale[0]}; the "
+            "split file or the dataset changed since); use a new --output-dir"
+        )
 
 
 def _refuse_credentials_as_models(parameters: RunParameters, environment: Mapping[str, str]) -> None:

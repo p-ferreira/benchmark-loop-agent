@@ -4,6 +4,7 @@ import random
 from typing import Sequence
 
 from .dataset import Case, load_cases
+from .split import part_case_ids
 
 
 def sample_cases(cases: Sequence[Case], size: int | None, seed: int) -> list[Case]:
@@ -22,6 +23,17 @@ def sample_cases(cases: Sequence[Case], size: int | None, seed: int) -> list[Cas
     return [case for index, case in enumerate(cases) if index in chosen]
 
 
-def select_cases(categories: Sequence[str], size: int | None, seed: int) -> list[Case]:
-    """The cases of every requested category, in the order the categories were given."""
-    return [case for category in categories for case in sample_cases(load_cases(category), size, seed)]
+def select_cases(categories: Sequence[str], size: int | None, seed: int, split: str | None = None) -> list[Case]:
+    """The cases of every requested category, in the order the categories were given.
+
+    With ``split`` only that part's cases are candidates, and a sample is drawn
+    inside the part. Without it nothing changes.
+    """
+    allowed = part_case_ids(split) if split is not None else None
+    chosen = []
+    for category in categories:
+        cases = load_cases(category)
+        if allowed is not None:
+            cases = [case for case in cases if case.case_id in allowed]
+        chosen += sample_cases(cases, size, seed) if cases else []
+    return chosen
