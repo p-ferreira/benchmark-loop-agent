@@ -68,13 +68,15 @@ class RecordStore:
             os.fsync(file.fileno())
 
 
-def write_manifest(directory: Path, parameters: dict[str, Any], session: dict[str, Any]) -> None:
+def write_manifest(directory: Path, parameters: dict[str, Any], session: dict[str, Any], run_id: str | None = None) -> None:
     """Create or update ``run.json``; each invocation is one numbered entry in ``sessions``."""
     path = directory / MANIFEST_FILE
     manifest: dict[str, Any] = json.loads(path.read_text()) if path.exists() else {}
     manifest.update(
         parameters=parameters, dataset_revision=DATASET_REVISION, scorer_revision=SCORER_REVISION
     )
+    if run_id and "run_id" not in manifest:  # one identifier for the run, kept across resumes
+        manifest["run_id"] = run_id
     sessions = manifest.setdefault("sessions", [])
     sessions[:] = [s for s in sessions if s["number"] != session["number"]] + [session]
     temporary = path.with_suffix(".tmp")

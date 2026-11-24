@@ -12,6 +12,7 @@ from .categories import CATEGORIES
 from .providers import send_request
 from .record import Record
 from .runner import PROVIDERS
+from .tracing import configure
 
 EXIT_ALL_PASSED = 0
 EXIT_SOME_FAILED = 1  # argparse uses 2 for bad usage, so 2 is skipped
@@ -70,7 +71,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         concurrency=args.concurrency,
     )
     try:
-        records = run_batch(args.output_dir, parameters, environment, send_request)
+        records = run_batch(args.output_dir, parameters, environment, send_request,
+                            tracing_for=lambda run_id: configure(environment, run_id))
     except ValueError as error:
         parser.error(str(error))
 

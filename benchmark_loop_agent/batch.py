@@ -1,6 +1,7 @@
 """Run a chosen set of cases through the chosen providers, resuming where a run stopped."""
 
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -12,6 +13,7 @@ from .retry import with_retries
 from .runner import PROVIDERS, run_provider
 from .sampling import select_cases
 from .providers import Send
+from .tracing import API_KEY_ENV, Tracing
 from .store import RecordStore, migrate_legacy_concurrency, now, read_manifest, read_records, write_manifest
 
 
@@ -39,13 +41,16 @@ def run_batch(
     environment: Mapping[str, str],
     send: Send,
     sleep: Callable[[float], Any] = time.sleep,
+    tracing_for: Callable[[str], Tracing | None] | None = None,
 ) -> list[Record]:
     """Run every unfinished (case, provider) pair and return this run's records.
 
     Cases with a ``pass`` or ``fail`` record in ``directory`` are skipped;
     ``unscored`` ones run again. Each record is written as soon as its case
     finishes. ``send`` is wrapped in bounded retries, per request; ``sleep``
-    is the backoff wait (replaceable so tests do not wait).
+    is the backoff wait (replaceable so tests do not wait). ``tracing_for``
+    receives the run identifier and returns the tracing to use, or ``None``;
+    tracing never changes a record or the result.
     """
     _refuse_credentials_as_models(parameters, environment)
     previous = read_manifest(directory)
@@ -68,14 +73,22 @@ def run_batch(
                if (name, case.case_id) not in finished]
 
     number = len(previous["sessions"]) + 1 if previous else 1
+    run_id = (previous or {}).get("run_id") or uuid.uuid4().hex
+    tracing = tracing_for(run_id) if tracing_for else None
     session: dict[str, Any] = {"number": number, "concurrency": parameters.concurrency, "started_at": now(), "ended_at": None, "wall_seconds": None}
-    write_manifest(directory, parameters.identity(), session)
+    write_manifest(directory, parameters.identity(), session, run_id)
     started = time.perf_counter()
     retrying = with_retries(send, sleep=sleep)
 
     def work(job: tuple[str, Case]) -> Record:
         name, case = job
-        record = run_provider(name, case, environment, retrying)
+        if tracing is None:
+            record = run_provider(name, case, environment, retrying)
+        else:
+            with tracing.case(provider=name, requested_model=parameters.models.get(name), case_id=case.case_id,
+                              category=case.category, invocation=number) as span:
+                record = run_provider(name, case, environment, retrying)
+                span.outcome(record)
         store.append(record)
         return record
 
@@ -85,7 +98,9 @@ def run_batch(
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
         session.update(ended_at=now(), wall_seconds=round(time.perf_counter() - started, 3))
-        write_manifest(directory, parameters.identity(), session)
+        write_manifest(directory, parameters.identity(), session, run_id)
+        if tracing is not None:
+            tracing.shutdown()
     return new_records + _kept(directory, cases, parameters.providers, {(r.provider, r.case_id) for r in new_records})
 
 
@@ -95,7 +110,7 @@ def _refuse_credentials_as_models(parameters: RunParameters, environment: Mappin
     The manifest records the requested model IDs verbatim, so a key mistakenly
     given as a model ID would be persisted. The error names the provider only.
     """
-    keys = [environment.get(p.key_env) for p in PROVIDERS.values()]
+    keys = [environment.get(p.key_env) for p in PROVIDERS.values()] + [environment.get(API_KEY_ENV)]
     for name, model in parameters.models.items():
         if model and any(key and key in model for key in keys):
             raise ValueError(f"the {name} model ID contains a configured API key; refusing to record it")

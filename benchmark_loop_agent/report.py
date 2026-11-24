@@ -1,0 +1,171 @@
+"""One Markdown report per model, built from a finished run's files only.
+
+Reads ``records.jsonl`` and ``run.json`` of the run directory and the rates
+file. It never reads Phoenix, the dataset or the network, so a report can be
+regenerated at any time.
+
+    python -m benchmark_loop_agent.report RUN_DIR [--rates FILE] [--output-dir DIR]
+"""
+
+import argparse
+import json
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+from typing import Any, Sequence
+
+from .dataset import DATA_DIR
+from .store import MANIFEST_FILE, RECORDS_FILE, read_manifest, read_records
+
+RATES_FILE = DATA_DIR / "rates.json"
+LISTED_CASES = 20  # how many case IDs to name when usage is missing
+OUTCOMES = ("pass", "fail", "unscored")
+
+
+def load_rates(path: Path) -> dict[str, dict[str, Any]]:
+    return json.loads(path.read_text())["models"]
+
+
+def accuracy(passed: int, failed: int) -> str:
+    judged = passed + failed
+    return f"{100 * passed / judged:.1f}% ({passed}/{judged})" if judged else "n/a (nothing judged)"
+
+
+def cost_of(rate: dict[str, Any], input_tokens: int, output_tokens: int) -> float:
+    return (input_tokens * rate["input"] + output_tokens * rate["output"]) / 1_000_000
+
+
+def wall_time(sessions: list[dict[str, Any]]) -> tuple[str, list[str]]:
+    """Total wall time, or why it is unavailable. Never derived from case latencies."""
+    lines, missing = [], []
+    for s in sorted(sessions, key=lambda s: s["number"]):
+        if s.get("ended_at") is None or s.get("wall_seconds") is None:
+            missing.append(str(s["number"]))
+            shown = "unavailable (no end time was saved; the invocation was interrupted)"
+        else:
+            shown = f"{s['wall_seconds']:.1f} s"
+        lines.append(f"| {s['number']} | {s.get('concurrency', 'n/a')} | {s['started_at']} | {s.get('ended_at') or '-'} | {shown} |")
+    if missing:
+        total = f"unavailable for invocation {', '.join(missing)}, so no total is given"
+    else:
+        total = f"{sum(s['wall_seconds'] for s in sessions):.1f} s over {len(sessions)} invocation(s)"
+    return total, lines
+
+
+def render(manifest: dict[str, Any], provider: str, records: list[dict[str, Any]],
+           rates: dict[str, dict[str, Any]]) -> str:
+    params = manifest["parameters"]
+    requested = params["models"].get(provider)
+    mine = [r for r in records if r["provider"] == provider]
+    sessions = manifest.get("sessions", [])
+    counts = Counter(r["outcome"] for r in mine)
+
+    seen_categories = {r["category"] for r in mine}
+    missing = [c for c in params["categories"] if c not in seen_categories]
+    sampled = params["sample_size"] is not None
+    problems = []
+    if counts["unscored"]:
+        problems.append(f"{counts['unscored']} case(s) are unscored")
+    if missing:
+        problems.append("no record for " + ", ".join(f"`{c}`" for c in missing))
+    if sessions and max(sessions, key=lambda s: s["number"]).get("ended_at") is None:
+        problems.append("the latest invocation has no saved end time")
+
+    out = [f"# Benchmark report: `{requested or 'model not set'}` ({provider})", ""]
+    if sampled:
+        out += [f"> **Sampled run.** {params['sample_size']} case(s) per category, seed {params['seed']}; "
+                "the figures are not those of the full dataset.", ""]
+    if problems:
+        out += ["> **Incomplete run.** " + "; ".join(problems) + ".", ""]
+
+    out += ["## Accuracy", "",
+            "Accuracy is pass / (pass + fail): unscored cases were not judged and are left out of it "
+            "(they are counted below). **Overall** pools every judged case of the model, so each case "
+            "counts once and a larger category weighs more; it is not the mean of the category figures.", "",
+            "| Category | Accuracy | Pass | Fail | Unscored |", "| --- | --- | --- | --- | --- |"]
+    for category in params["categories"]:
+        c = Counter(r["outcome"] for r in mine if r["category"] == category)
+        out.append(f"| `{category}` | {accuracy(c['pass'], c['fail'])} | {c['pass']} | {c['fail']} | {c['unscored']} |")
+    out += [f"| **Overall** | **{accuracy(counts['pass'], counts['fail'])}** | {counts['pass']} | {counts['fail']} | {counts['unscored']} |", ""]
+
+    with_usage = [r for r in mine if r["input_tokens"] is not None and r["output_tokens"] is not None]
+    no_usage = [r["case_id"] for r in mine if r["input_tokens"] is None or r["output_tokens"] is None]
+    in_tokens = sum(r["input_tokens"] for r in with_usage)
+    out_tokens = sum(r["output_tokens"] for r in with_usage)
+    out += ["## Tokens and cost", "",
+            f"* Input tokens: {in_tokens:,}", f"* Output tokens: {out_tokens:,}",
+            f"* Records with reported usage: {len(with_usage)} of {len(mine)}"]
+    if no_usage:
+        shown = ", ".join(f"`{c}`" for c in no_usage[:LISTED_CASES])
+        more = f" and {len(no_usage) - LISTED_CASES} more" if len(no_usage) > LISTED_CASES else ""
+        out.append(f"* {len(no_usage)} case(s) have no reported usage and are not counted in the tokens "
+                   f"or the cost; nothing was estimated for them: {shown}{more}")
+    rate = rates.get(requested) if requested else None
+    if rate is None:
+        out.append(f"* Cost: not given, the rates file has no entry for `{requested}`.")
+    else:
+        out += [f"* Cost: **${cost_of(rate, in_tokens, out_tokens):.4f}** at {rate['input']:.2f} (input) and "
+                f"{rate['output']:.2f} (output) US dollars per 1 million tokens, standard tier "
+                f"([pricing page]({rate['page']}), read on {rate['read_on']}).",
+                "* The cost counts all input tokens at the uncached input rate. The records do not separate "
+                "cached input, which both providers price lower, so the cost can overstate what was charged."]
+    out.append("")
+
+    total, rows = wall_time(sessions)
+    out += ["## Time", "",
+            "The wall time is that of the whole run, as saved in `run.json`; all providers of the run "
+            "share its invocations.", "", f"* Wall time: {total}", "",
+            "| Invocation | Concurrency | Started | Ended | Wall time |", "| --- | --- | --- | --- | --- |", *rows, ""]
+
+    actual = sorted({r["actual_model"] for r in mine if r["actual_model"]})
+    out += ["## Run", "",
+            f"* Run identifier: `{manifest.get('run_id', 'n/a')}`",
+            f"* Requested model: `{requested}`",
+            f"* Actual model (as the responses report it): {', '.join(f'`{m}`' for m in actual) or 'none, no response arrived'}",
+            f"* Dataset revision: `{manifest.get('dataset_revision')}`",
+            f"* Scorer revision: `{manifest.get('scorer_revision')}`",
+            f"* Categories: {', '.join(f'`{c}`' for c in params['categories'])}",
+            f"* Sample size per category: {params['sample_size'] if sampled else 'all cases'}",
+            f"* Seed: {params['seed']}",
+            f"* Providers in the run: {', '.join(params['providers'])}", ""]
+    return "\n".join(out)
+
+
+def file_name(provider: str, model: str | None) -> str:
+    return "report-" + re.sub(r"[^A-Za-z0-9._-]+", "_", f"{provider}-{model or 'unset'}") + ".md"
+
+
+def build_reports(run_dir: Path, rates_path: Path, output_dir: Path) -> list[Path]:
+    manifest = read_manifest(run_dir)
+    if manifest is None:
+        raise ValueError(f"{run_dir / MANIFEST_FILE} not found: not a run directory")
+    records = read_records(run_dir / RECORDS_FILE)
+    rates = load_rates(rates_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for provider in manifest["parameters"]["providers"]:
+        path = output_dir / file_name(provider, manifest["parameters"]["models"].get(provider))
+        path.write_text(render(manifest, provider, records, rates))
+        written.append(path)
+    return written
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="benchmark_loop_agent.report",
+                                     description="Write one Markdown report per model from a run directory.")
+    parser.add_argument("run_dir", type=Path, help="the --output-dir of a finished run")
+    parser.add_argument("--rates", type=Path, default=RATES_FILE, help="rates file (default: data/rates.json)")
+    parser.add_argument("--output-dir", type=Path, default=None, help="where the reports go (default: the run directory)")
+    args = parser.parse_args(argv)
+    try:
+        paths = build_reports(args.run_dir, args.rates, args.output_dir or args.run_dir)
+    except (ValueError, OSError, KeyError) as error:
+        parser.error(f"{type(error).__name__}: {error}")
+    for path in paths:
+        print(path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
