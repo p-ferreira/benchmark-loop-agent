@@ -28,11 +28,14 @@ class RunParameters:
     providers: tuple[str, ...]
     models: dict[str, str | None]  # requested model ID per provider (no default in code)
     concurrency: int
+    split: str | None = None  # a part of the split file; None means every case
 
     def identity(self) -> dict[str, Any]:
         """The parameters a resumed run must repeat (concurrency may change; each session records its own)."""
         data = asdict(self)
         del data["concurrency"]
+        if data["split"] is None:  # a run without a part is saved as before, so earlier runs still resume
+            del data["split"]
         return data
 
 
@@ -64,10 +67,10 @@ def run_batch(
         if saved != _jsonable(parameters.identity()):
             raise ValueError(
                 f"{directory} holds a run with different parameters; use a new --output-dir "
-                "or repeat the original categories, sample size, seed, providers and models"
+                "or repeat the original categories, sample size, seed, split part, providers and models"
             )
 
-    cases = select_cases(parameters.categories, parameters.sample_size, parameters.seed)
+    cases = select_cases(parameters.categories, parameters.sample_size, parameters.seed, parameters.split)
     store = RecordStore(directory)
     finished = store.open_for_resume()
     pending = [(name, case) for case in cases for name in parameters.providers

@@ -49,6 +49,7 @@ Running the same command again on the same `--output-dir` resumes the run.
 | `--categories C [C ...]` | categories to run (default: all thirteen) |
 | `--sample-size N` | cases per category, drawn with `--seed` (default: every case) |
 | `--seed S` | seed for the draw (default `0`); the same seed picks the same cases, and a category's draw does not depend on which other categories run |
+| `--split PART` | `development`, `validation` or `held-out`: run only that part's cases of [`data/split.json`](#development-validation-and-held-out-split). Combines with `--categories`, `--sample-size` and `--seed` (the sample is drawn inside the part). Written in `run.json`; resuming with another part is refused. Without it nothing changes |
 | `--provider P` | `openai` or `anthropic`; repeat for both (default: both) |
 | `--openai-model ID`, `--anthropic-model ID` | model IDs; otherwise `OPENAI_MODEL` / `ANTHROPIC_MODEL`. No default in code: a provider without one is `unscored` |
 | `--concurrency N` | requests in flight at once (default `4`) |
@@ -86,12 +87,50 @@ checks this table against them.
 | `live_relevance` | passes if the model makes a call | 16 |
 | **Total** | | 3641 |
 
+## Development, validation and held-out split
+
+A gain measured on cases an instruction was tuned on is not evidence, so every
+one of the 3641 cases belongs to exactly one of three parts: development (to
+tune on), validation (to choose between candidates) and held-out (to report
+on). The split is committed as [`data/split.json`](data/split.json), with the
+seed, the proportions and the dataset revision written in it. It holds case
+identifiers and part names only: no question, tool or answer text.
+
+Rebuild it, byte for byte, from the question files (the builder never reads the
+expected answers):
+
+```sh
+uv run --locked python -m benchmark_loop_agent.split --seed 0 --development 50 --validation 20 --held-out 30
+# --output FILE writes somewhere else; the defaults are the committed values
+```
+
+**Groups.** BFCL repeats tool sets and questions across cases and categories,
+and a case that shares either with a case in another part would leak it. Two
+cases are therefore in one group when they have the same set of tool
+definitions (as parsed from the question files, independent of key order inside
+a definition and of tool order) or an identical question (as parsed; the
+expected answer and the category play no part). The case identifier is never
+used. Grouping is transitive, and a group is never divided between parts. The
+split is stratified by category: whole groups are given to the part whose share
+of each category they bring closest to the proportions, so a group that spans
+categories is assigned once.
+
+Counted from the committed file and the question files (a test checks this
+table):
+
+| Part | Cases | Groups |
+|------|-------|--------|
+| development | 1820 | 773 |
+| validation | 729 | 487 |
+| held-out | 1092 | 604 |
+| **Total** | 3641 | 1864 |
+
 ## Output directory
 
 * `records.jsonl`: one JSON Lines record per case and provider, appended as
   each case finishes.
-* `run.json`: the run's parameters (categories, sample size, seed, providers,
-  model IDs), the dataset and scorer revisions, and for every invocation its
+* `run.json`: the run's parameters (categories, sample size, seed, split part
+  when `--split` was used, providers, model IDs), the number of cases selected per category, the dataset and scorer revisions, and for every invocation its
   number, concurrency, start time, end time and wall time. A model ID that
   contains a configured API key is refused before anything is written. A run that was
   interrupted has an invocation with no end time.
@@ -116,7 +155,7 @@ One case's or one provider's failure never changes or prevents another record.
 * A case with a `pass` or `fail` record is skipped. An `unscored` one runs
   again, and its old record is replaced, so the file keeps one record per case
   and provider. A line cut short by an interruption is dropped.
-* Resuming with different parameters (categories, sample size, seed, providers
+* Resuming with different parameters (categories, sample size, seed, split part, providers
   or models) is refused, since the records would no longer belong to one run.
   Concurrency may change; each invocation records its own.
 * Rate limits (429), server errors (5xx), timeouts and dropped connections are
@@ -279,6 +318,13 @@ directory unless `--output-dir` says otherwise. A report holds:
   Accuracy is pass / (pass + fail); unscored cases were not judged. **Overall**
   pools every judged case, so each case counts once and a larger category
   weighs more; it is not the mean of the category figures;
+* the **comparison figure**, per category and overall: passes divided by the
+  cases the run selected, as `run.json` records them. Unscored cases and
+  selected cases with no record (an interrupted run) stay in the denominator, so
+  they count against it, unlike accuracy, which is unchanged. An older run whose
+  `run.json` does not record the selection shows the figure as unavailable.
+  A `--split` run reports, and names, its part; a run without `--split` is not
+  broken down by part;
 * input and output tokens, and the cases without reported usage, counted and
   named (their tokens are not estimated);
 * cost, from `data/rates.json`: input and output tokens at the rate of the
@@ -299,6 +345,19 @@ directory unless `--output-dir` says otherwise. A report holds:
   (the selection size is saved in `run.json`), or a last invocation that never
   ended). A record with only one token count still contributes that count; cases
   missing either are all named, with the missing one.
+
+### Repeated runs
+
+Give the report command several run directories of one configuration (same
+providers, models, split part, categories, sample size and seed) and it writes
+`repeated-<provider>-<model>.md`: the lowest, highest and mean comparison
+figure and the number of runs, per category and overall. Directories whose
+configurations differ, or a run whose figure is unavailable, are refused with a
+message that says why.
+
+```sh
+uv run --locked python -m benchmark_loop_agent.report runs/a runs/b runs/c --output-dir runs/spread
+```
 
 ## Tests
 

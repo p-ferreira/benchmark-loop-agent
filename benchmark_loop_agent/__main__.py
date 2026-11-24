@@ -12,6 +12,7 @@ from .categories import CATEGORIES
 from .providers import send_request
 from .record import Record
 from .runner import PROVIDERS
+from .split import PARTS
 from .tracing import configure
 
 EXIT_ALL_PASSED = 0
@@ -41,6 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-size", type=int, default=None, metavar="N",
                         help="cases per category, chosen with --seed (default: every case)")
     parser.add_argument("--seed", type=int, default=0, help="seed for --sample-size (default: 0)")
+    parser.add_argument("--split", choices=PARTS, default=None, metavar="PART",
+                        help="run only the cases of one part of data/split.json: " + ", ".join(PARTS) + " (default: every case)")
     parser.add_argument("--provider", action="append", choices=sorted(PROVIDERS),
                         help="provider to run; repeat for several (default: all)")
     parser.add_argument("--openai-model", help="OpenAI model ID (default: $OPENAI_MODEL)")
@@ -69,6 +72,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         providers=names,
         models={n: environment.get(PROVIDERS[n].model_env) or None for n in names},
         concurrency=args.concurrency,
+        split=args.split,
     )
     try:
         records = run_batch(args.output_dir, parameters, environment, send_request,
