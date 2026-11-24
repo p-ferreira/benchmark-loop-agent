@@ -61,27 +61,41 @@ def render(manifest: dict[str, Any], provider: str, records: list[dict[str, Any]
     sessions = manifest.get("sessions", [])
     counts = Counter(r["outcome"] for r in mine)
 
-    selection = manifest.get("selection")  # expected number of cases per category, saved when the run started
-    if selection is None:  # a run saved before this was recorded: only a wholly absent category can be seen
-        seen = {r["category"] for r in mine}
-        short = [f"`{c}`" for c in params["categories"] if c not in seen]
+    selection = manifest.get("selection")  # cases per category in this run, saved when it started
+    cap = params["sample_size"]  # a maximum: a category with fewer cases is taken whole
+    sampled = cap is not None
+    size = {c: sum(1 for r in mine if r["category"] == c) for c in params["categories"]}
+    problems, notes = [], []
+    if selection is None:  # a run saved before the counts were recorded
+        absent = [f"`{c}`" for c in params["categories"] if not size[c]]
+        notes.append("This run's files do not record how many cases each category held, so whether every "
+                     "selected case has a record cannot be established" +
+                     (f"; no record exists for {', '.join(absent)} (an empty category cannot be told from a lost one)"
+                      if absent else "") + ".")
     else:
-        short = [f"`{c}` ({sum(1 for r in mine if r['category'] == c)} of {selection.get(c, 0)} case(s))"
-                 for c in params["categories"]
-                 if sum(1 for r in mine if r["category"] == c) < selection.get(c, 0)]
-    sampled = params["sample_size"] is not None
-    problems = []
+        short = [f"`{c}` ({size[c]} of {selection.get(c, 0)} case(s))"
+                 for c in params["categories"] if size[c] < selection.get(c, 0)]
+        if short:
+            problems.append("records missing for " + ", ".join(short))
     if counts["unscored"]:
         problems.append(f"{counts['unscored']} case(s) are unscored")
-    if short:
-        problems.append("records missing for " + ", ".join(short))
     if sessions and max(sessions, key=lambda s: s["number"]).get("ended_at") is None:
         problems.append("the latest invocation has no saved end time")
 
     out = [f"# Benchmark report: `{requested or 'model not set'}` ({provider})", ""]
     if sampled:
-        out += [f"> **Sampled run.** {params['sample_size']} case(s) per category, seed {params['seed']}; "
-                "the figures are not those of the full dataset.", ""]
+        if selection is None:
+            sizes = f"at most {cap} case(s) per category (actual sizes not recorded)"
+            whole = False
+        else:
+            sizes = f"at most {cap} case(s) per category, selected: " + ", ".join(
+                f"`{c}` {selection.get(c, 0)}" for c in params["categories"])
+            whole = all(selection.get(c, 0) < cap for c in params["categories"])
+        out += [f"> **Sampled run.** {sizes}, seed {params['seed']}; " + (
+            "every category was smaller than the maximum, so the whole of each was taken." if whole
+            else "the figures are not necessarily those of the full dataset."), ""]
+    for note in notes:
+        out += ["> **Completeness unknown.** " + note, ""]
     if problems:
         out += ["> **Incomplete run.** " + "; ".join(problems) + ".", ""]
 
@@ -116,7 +130,7 @@ def render(manifest: dict[str, Any], provider: str, records: list[dict[str, Any]
                 f"{rate['output']:.2f} (output) US dollars per 1 million tokens, standard tier "
                 f"([pricing page]({rate['page']}), read on {rate['read_on']}).",
                 "* The cost counts all input tokens at the uncached input rate. The records do not separate "
-                "cached input, which both providers price lower, so the cost can overstate what was charged."]
+                "cached input, which both providers price lower, so the cost can overstate what was charged. With missing usage, the figure is a lower bound only on this uncached-rate calculation from complete usage; real discounts can put the charge below it."]
     out.append("")
 
     total, rows = wall_time(sessions, params.get("concurrency"))
@@ -133,7 +147,7 @@ def render(manifest: dict[str, Any], provider: str, records: list[dict[str, Any]
             f"* Dataset revision: `{manifest.get('dataset_revision')}`",
             f"* Scorer revision: `{manifest.get('scorer_revision')}`",
             f"* Categories: {', '.join(f'`{c}`' for c in params['categories'])}",
-            f"* Sample size per category: {params['sample_size'] if sampled else 'all cases'}",
+            f"* Sample size per category: {f'at most {cap}' if sampled else 'all cases'}",
             f"* Seed: {params['seed']}",
             f"* Providers in the run: {', '.join(params['providers'])}", ""]
     return "\n".join(out)

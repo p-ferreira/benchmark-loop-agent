@@ -124,13 +124,30 @@ class ReportTests(unittest.TestCase):
     def test_a_sampled_run_says_so_at_the_top(self) -> None:
         lines = self.render(sample_size=2).splitlines()
         self.assertTrue(lines[2].startswith("> **Sampled run.**"))
-        self.assertIn("2 case(s) per category, seed 4", lines[2])
+        self.assertIn("at most 2 case(s) per category", lines[2])
 
     def test_a_complete_full_run_has_no_warning(self) -> None:
         records = [r for r in RECORDS if r["outcome"] != "unscored"]
         text = self.render(records=records, selection={"simple_python": 2, "irrelevance": 2})
         self.assertNotIn("Incomplete run", text)
         self.assertNotIn("Sampled run", text)
+
+    def test_a_cap_above_the_category_size_is_a_maximum(self) -> None:
+        records = [record("openai", f"a{i}", "simple_python", "pass", (1, 1)) for i in range(400)]
+        text = report.render(manifest([DONE], sample_size=401, categories=("simple_python",),
+                                      selection={"simple_python": 400}), "openai", records, RATES)
+        self.assertIn("at most 401 case(s) per category", text)
+        self.assertIn("`simple_python` 400", text)
+        self.assertIn("whole of each was taken", text)
+        self.assertNotIn("Incomplete run", text)
+        self.assertNotIn("not necessarily", text)
+
+    def test_legacy_files_disclose_that_completeness_is_unknown(self) -> None:
+        records = [record("openai", "a1", "simple_python", "pass", (1, 1))]
+        text = report.render(manifest([DONE], sample_size=2, selection=None), "openai", records, RATES)
+        self.assertIn("**Completeness unknown.**", text)
+        self.assertIn("no record exists for `irrelevance`", text)
+        self.assertNotIn("Incomplete run", text)
 
     def test_the_command_reads_only_the_run_directory_and_the_rates_file(self) -> None:
         directory = Path(tempfile.mkdtemp())

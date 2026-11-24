@@ -258,5 +258,17 @@ def configure(environment: Mapping[str, str], run_id: str) -> Tracing | None:
             instrumentor.instrument(tracer_provider=provider)
         return Tracing(provider, provider.get_tracer("benchmark_loop_agent"), run_id, instrumentors, restore_logging)
     except Exception as error:  # tracing must not stop the run
+        for instrumentor in locals().get("instrumentors") or ():
+            try:
+                instrumentor.uninstrument()
+            except Exception:
+                pass
+        if (provider := locals().get("provider")) is not None:
+            try:
+                provider.shutdown()
+            except Exception:
+                pass
+        if (restore := locals().get("restore_logging")) is not None:
+            restore()
         print(f"tracing disabled: {type(error).__name__}", file=sys.stderr)
         return None
