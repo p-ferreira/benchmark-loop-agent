@@ -56,6 +56,8 @@ class Receiver:
                                     "parent_id": span.parent_span_id.hex(),
                                     "attributes": {a.key: _value(a.value) for a in span.attributes},
                                     "resource": resource_attributes,
+                                    "start_ns": span.start_time_unix_nano,
+                                    "end_ns": span.end_time_unix_nano,
                                     "status": (span.status.code, span.status.message),
                                 })
                 self.send_response(receiver.status, receiver.reason)

@@ -301,6 +301,48 @@ class CaseSpanContent(TracingTestCase):
             records = self.run_batch(FakeSend(wrong), self.env(), directory=Path(tempfile.mkdtemp()) / "out")
         self.assertEqual([r.outcome for r in records], outcomes)
 
+    def test_every_batch_is_attempted_whatever_happens_to_the_others(self) -> None:
+        count = 3 * tracing.ANNOTATION_BATCH + 5  # four batches
+        real_post, calls = requests.post, []
+
+        def post(url, **kwargs):
+            calls.append(len(kwargs["json"]["data"]))
+            if len(calls) == 1:
+                raise requests.ConnectionError("refused")  # must not end the others' attempts
+            return real_post(url, **kwargs)
+
+        sender = tracing.Tracing(None, None, "run", endpoint=self.receiver.url)
+        for number in range(count):
+            sender.add_annotation({"span_id": f"{number:016x}", "name": "bfcl"})
+        with mock.patch.object(tracing, "ANNOTATION_WORKERS", 1), mock.patch("requests.post", post), \
+                contextlib.redirect_stderr(io.StringIO()):
+            sender.send_annotations()
+        self.assertEqual(sorted(calls), [5, 100, 100, 100])
+        self.assertEqual(len(self.receiver.annotations), count - 100)  # all but the refused batch
+
+    def test_slow_batches_do_not_use_up_the_time_of_later_ones(self) -> None:
+        self.receiver.annotation_delay = 0.3
+        sender = tracing.Tracing(None, None, "run", endpoint=self.receiver.url)
+        for number in range(4 * tracing.ANNOTATION_BATCH):
+            sender.add_annotation({"span_id": f"{number:016x}", "name": "bfcl"})
+        with mock.patch.object(tracing, "ANNOTATION_WORKERS", 1):
+            sender.send_annotations()
+        self.assertEqual(len(self.receiver.annotations), 4 * tracing.ANNOTATION_BATCH)
+
+    def test_the_scoring_span_covers_the_checker(self) -> None:
+        import time as clock
+        from benchmark_loop_agent import runner
+        real = runner.score_calls
+
+        def slow(*args, **kwargs):
+            clock.sleep(0.2)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(runner, "score_calls", slow):
+            self.run_batch(FakeSend(perfect), self.env(), sample_size=1)
+        (span,) = self.receiver.scoring_spans()
+        self.assertGreaterEqual(span["end_ns"] - span["start_ns"], 150_000_000)
+
     def test_a_failed_annotation_send_is_not_repeated_on_resume(self) -> None:
         self.receiver.annotation_status = 500
         with contextlib.redirect_stderr(io.StringIO()):

@@ -16,6 +16,7 @@ import json
 import logging
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 import traceback
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
@@ -38,7 +39,7 @@ SCORING_SPAN_NAME = "bfcl_scoring"
 ANNOTATION_PATH = "/v1/span_annotations"
 ANNOTATION_NAME = "bfcl"
 ANNOTATION_TIMEOUT_SECONDS = 5
-ANNOTATION_TOTAL_SECONDS = 10
+ANNOTATION_WORKERS = 8
 ANNOTATION_BATCH = 100
 RELEVANCE_NOTE = ("BFCL's relevance rule: the model passes by making (or not making) a function call; "
                   "this category holds no expected answer.")
@@ -201,24 +202,30 @@ class Tracing:
         self._annotations.append(annotation)  # list.append is atomic: the runner's threads share it
 
     def send_annotations(self) -> None:
-        """Send the ``bfcl`` annotations once, best effort, bounded in time; nothing is kept or retried."""
-        if not self._endpoint or not self._annotations:
+        """Send the ``bfcl`` annotations once, best effort; nothing is kept or retried.
+
+        Every batch gets its own attempt with its own time limit: a slow or failing batch
+        does not cost the others theirs. Batches go out a few at a time to bound the total."""
+        annotations, self._annotations = self._annotations, []
+        if not self._endpoint or not annotations:
             return
-        deadline = time.monotonic() + ANNOTATION_TOTAL_SECONDS
         headers = {"authorization": f"Bearer {self._api_key}"} if self._api_key else {}
         url = self._endpoint.rstrip("/") + ANNOTATION_PATH
-        try:
-            for start in range(0, len(self._annotations), ANNOTATION_BATCH):
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    break
-                batch = scrub(self._annotations[start:start + ANNOTATION_BATCH], self._secrets)
+
+        def send(start: int) -> str | None:
+            try:
+                batch = scrub(annotations[start:start + ANNOTATION_BATCH], self._secrets)
                 requests.post(url, json={"data": batch}, headers=headers,
-                              timeout=min(ANNOTATION_TIMEOUT_SECONDS, left))
-        except Exception as error:  # the type only: a message could carry the address or a key
-            print(f"annotations not sent: {type(error).__name__}", file=sys.stderr)
-        finally:
-            self._annotations = []
+                              timeout=ANNOTATION_TIMEOUT_SECONDS).raise_for_status()
+                return None
+            except Exception as error:  # the type only: a message could carry the address or a key
+                return type(error).__name__
+
+        with ThreadPoolExecutor(max_workers=ANNOTATION_WORKERS) as pool:
+            failures = [f for f in pool.map(send, range(0, len(annotations), ANNOTATION_BATCH)) if f]
+        if failures:
+            print(f"annotations not sent: {len(failures)} batch(es) failed ({', '.join(sorted(set(failures)))})",
+                  file=sys.stderr)
 
     def shutdown(self) -> None:
         """Send what is queued, within a time limit. A failure here is not reported as an error."""
@@ -245,6 +252,11 @@ class CaseSpan:
         self._metadata = metadata
         self._outcome: tuple[Any, ...] | None = None
         self._output: str | None = None
+        self._scoring_window: tuple[int, int] | None = None
+
+    def scored(self, start_ns: int, end_ns: int) -> None:
+        """When the checker ran, so the scoring span covers the work it describes."""
+        self._scoring_window = (start_ns, end_ns)
 
     def outcome(self, record: Any, case: Any = None) -> None:
         """Called with the finished record: only now is the scoring span written and the expected answer read."""
@@ -275,11 +287,12 @@ class CaseSpan:
         reason = "; ".join(record.reasons)
         scoring = self._tracing._tracer.start_span(
             SCORING_SPAN_NAME, context=trace.set_span_in_context(self._span),
+            start_time=self._scoring_window[0] if self._scoring_window else None,
             attributes={"openinference.span.kind": "EVALUATOR",
                         "input.value": json.dumps(payload), "input.mime_type": "application/json",
                         "output.value": json.dumps({"verdict": record.outcome, "reason": reason}),
                         "output.mime_type": "application/json"})
-        scoring.end()
+        scoring.end(end_time=self._scoring_window[1] if self._scoring_window else None)
 
     def finish(self) -> None:
         if self._span is None:

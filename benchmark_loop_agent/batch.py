@@ -91,7 +91,7 @@ def run_batch(
             with tracing.case(provider=name, requested_model=parameters.models.get(name), case_id=case.case_id,
                               category=case.category, invocation=number,
                               question="\n".join(m.get("content", "") for m in case.messages)) as span:
-                record = run_provider(name, case, environment, retrying)
+                record = run_provider(name, case, environment, retrying, span.scored)
                 span.outcome(record, case)
         store.append(record)
         return record
