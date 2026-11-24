@@ -329,6 +329,27 @@ class CaseSpanContent(TracingTestCase):
             sender.send_annotations()
         self.assertEqual(len(self.receiver.annotations), 4 * tracing.ANNOTATION_BATCH)
 
+    def test_no_shared_cutoff_shortens_a_later_batch_after_earlier_ones_took_long(self) -> None:
+        now, timeouts = [0.0], []
+
+        class Response:
+            def raise_for_status(self) -> None:
+                pass
+
+        def post(url, **kwargs):
+            timeouts.append(kwargs["timeout"])
+            now[0] += 4  # simulated: each successful batch takes 4 s, 16 s in all
+            return Response()
+
+        sender = tracing.Tracing(None, None, "run", endpoint=self.receiver.url)
+        for number in range(4 * tracing.ANNOTATION_BATCH):
+            sender.add_annotation({"span_id": f"{number:016x}", "name": "bfcl"})
+        with mock.patch.object(tracing, "ANNOTATION_WORKERS", 1), mock.patch("requests.post", post), \
+                mock.patch("time.monotonic", lambda: now[0]), mock.patch("time.time", lambda: now[0]):
+            sender.send_annotations()
+        self.assertGreater(now[0], 10)
+        self.assertEqual(timeouts, [tracing.ANNOTATION_TIMEOUT_SECONDS] * 4)
+
     def test_the_scoring_span_covers_the_checker(self) -> None:
         import time as clock
         from benchmark_loop_agent import runner
