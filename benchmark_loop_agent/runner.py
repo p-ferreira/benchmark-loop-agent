@@ -55,7 +55,8 @@ def redact_record(record: Record, secrets: Sequence[str]) -> Record:
 
 
 def run_provider(
-    name: str, case: Case, environment: Mapping[str, str], send: Send
+    name: str, case: Case, environment: Mapping[str, str], send: Send,
+    scored: Callable[[int, int], None] | None = None,
 ) -> Record:
     """Run the case against one provider and return its record. Never raises."""
     provider = PROVIDERS[name]
@@ -98,8 +99,16 @@ def run_provider(
 
     # Scoring is the only step that reads expected answers, and it runs after
     # the model has answered.
+    scoring_started = time.time_ns()
     try:
-        verdict = score_calls(case, response.calls, response.malformed, response.deep_calls)
+        try:
+            verdict = score_calls(case, response.calls, response.malformed, response.deep_calls)
+        finally:
+            if scored is not None:
+                try:
+                    scored(scoring_started, time.time_ns())
+                except Exception:
+                    pass
     except ReferenceDataError as error:
         # Our data is unreadable, not the model wrong: unscored, so a resume retries it.
         return record("unscored", [str(error)], calls=response.calls_for_record,

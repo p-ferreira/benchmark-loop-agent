@@ -145,7 +145,7 @@ def render(manifest: dict[str, Any], provider: str, records: list[dict[str, Any]
     out += ["## Run", "",
             f"* Run identifier: `{manifest.get('run_id', 'n/a')}`",
             f"* Requested model: `{requested}`",
-            f"* Actual model (as the responses report it): {', '.join(f'`{m}`' for m in actual) or 'none, no response arrived'}",
+            f"* Actual model (as the responses report it): {', '.join(f'`{m}`' for m in actual) or 'none, no actual model was reported'}",
             f"* Dataset revision: `{manifest.get('dataset_revision')}`",
             f"* Scorer revision: `{manifest.get('scorer_revision')}`",
             f"* Categories: {', '.join(f'`{c}`' for c in params['categories'])}",
