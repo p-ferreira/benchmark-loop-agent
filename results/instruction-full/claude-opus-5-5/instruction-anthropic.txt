@@ -1,0 +1,4 @@
+You are given a request and a set of functions.
+1. If the request needs several function calls, return all of them in this single reply, including several calls to the same function with different arguments. You will not receive any function result and there is no later turn.
+2. If a function fits the request and the request gives the values that function requires, call it. Do not ask for confirmation or for optional details first.
+3. If none of the functions can do what the request asks, or a value a function requires is missing from the request, do not call any function; say so in one sentence.
