@@ -199,8 +199,11 @@ the file is changed or removed.
 the question and answer content of the failed cases, the writer and the limits), written before the first request.
 It has one JSON line per batch (SHA-256 of each case identifier, the writer's provider and model as requested and as reported (`null` when the reply does not report one),
 SHA-256 of the request, every rule with whether it was kept and why not, tokens) and a final line of totals (batches, rules returned, kept and refused by reason, tokens, SHA-256 and
-byte length of `FILE` and `OUT`). A rule refused for an expected value or a key is logged as its SHA-256 and length
-only. The log holds no expected value and no key. It is only appended to; the one thing ever cut is a last line left unfinished by an interruption. It is locked while a run uses it.
+byte length of `FILE` and `OUT`). A rule refused for an expected value or a key, and any rule, kept or not, that holds an expected value (two
+characters or more) of a failed case of the run, is logged as its SHA-256 and length only (`text_withheld`); a resumed
+run then takes a withheld kept rule from the line of `OUT` with that digest, and refuses when `OUT` lacks it. The log
+holds no expected value and no key. A model ID that contains a configured key is refused, and so is an existing log
+that is not one of this command's (it is never truncated). It is only appended to; the one thing ever cut is a last line left unfinished by an interruption. It is locked while a run uses it.
 
 **Refusals (exit code 2, before any request).** A run that is not `--split development`; a run of several providers
 or of none; any record, passing or not, whose case is not in the development part of `data/split.json`; a failed

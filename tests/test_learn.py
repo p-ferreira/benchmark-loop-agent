@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -194,27 +195,57 @@ class KeepingTests(LearnTest):
         self.assertNotIn(WRITER_KEY, logtext)
         self.assertNotIn(ENV["ANTHROPIC_API_KEY"], logtext)
 
-    def test_an_expected_value_of_a_case_of_another_batch_is_refused_and_never_logged(self) -> None:
+    def test_an_expected_value_of_another_batch_is_not_a_reason_to_refuse_but_is_never_logged(self) -> None:
         other = self.markers[self.failed[4].case_id]  # a case of batch 2 of 3, returned in batch 0
         self.run_cli([f"Mention {other}"], argv=self.argv(batch_size=2))
         rule = self.log()[0]["rules"][0]
-        self.assertEqual((rule["kept"], rule["refused"]), (False, "expected-value"))
+        self.assertEqual((rule["kept"], rule["refused"], rule["text_withheld"]), (True, None, True))
         self.assertNotIn("text", rule)
         self.assertNotIn(other, Path(str(self.out) + ".log.jsonl").read_text())
-        self.assertNotIn(other, self.out.read_text())
-        self.assertEqual(self.log()[2]["rules"][0]["refused"], "expected-value")
 
-    def test_a_short_expected_value_that_is_the_whole_rule_is_not_logged(self) -> None:
+    def test_a_short_expected_value_inside_a_rule_is_kept_but_never_logged(self) -> None:
         rows = [json.loads(line) for line in (dataset.DATA_DIR / "answers" / "BFCL_v4_simple_python.json").read_text().splitlines()]
         for row in rows:
-            if row["id"] == self.failed[4].case_id:
+            if row["id"] == self.failed[0].case_id:
                 (name, options), = row["ground_truth"][0].items()
                 options[next(iter(options))].append("zq9")
         (dataset.DATA_DIR / "answers" / "BFCL_v4_simple_python.json").write_text("".join(json.dumps(r) + "\n" for r in rows))
         dataset.load_expected_answers.cache_clear()
-        self.run_cli(["zq9"], argv=self.argv(batch_size=2))
+        self.run_cli(["Use zq9 consistently."], argv=self.argv(batch_size=2))
         self.assertNotIn("zq9", Path(str(self.out) + ".log.jsonl").read_text())
-        self.assertEqual(self.log()[0]["rules"][0]["refused"], "expected-value")
+        self.assertIn("Use zq9 consistently.", self.out.read_text())
+        self.assertEqual(self.log()[0]["rules"][0]["refused"], None)
+
+    def test_a_withheld_kept_rule_is_replayed_from_the_output_on_resume(self) -> None:
+        other = self.markers[self.failed[4].case_id]
+        replies = [f"Mention {other}"]
+        self.run_cli(replies, argv=self.argv(batch_size=2))
+        code, send, _ = self.run_cli(replies, argv=self.argv(batch_size=2))
+        self.assertEqual((code, len(send.requests)), (0, 0))
+
+    def test_a_log_that_is_not_ours_is_refused_and_left_alone(self) -> None:
+        log = Path(str(self.out) + ".log.jsonl")
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("my notes without a newline")
+        code, send, _ = self.run_cli([])
+        self.assertEqual((code, len(send.requests)), (2, 0))
+        self.assertEqual(log.read_text(), "my notes without a newline")
+
+    def test_a_secret_in_the_writer_model_is_refused_before_the_log_exists(self) -> None:
+        code, send, _ = self.run_cli([], argv=self.argv(writer_model=WRITER_KEY))
+        self.assertEqual((code, len(send.requests)), (2, 0))
+        self.assertFalse(Path(str(self.out) + ".log.jsonl").exists())
+
+    def test_a_short_write_is_finished(self) -> None:
+        real = os.write
+
+        def short(fd, data):
+            return real(fd, bytes(data)[:7])
+
+        with mock.patch("benchmark_loop_agent.learn.os.write", short):
+            code, _, _ = self.run_cli(["Rule one."])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.log_lines()), 5)  # header, three batches, totals
 
     def test_unicode_line_breaks_make_a_rule_not_single_line(self) -> None:
         rules = ["Ends with a separator. ", "Ends with a paragraph. ", "Ends with form feed.\x0c", "Fine."]

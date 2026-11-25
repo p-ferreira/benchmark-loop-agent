@@ -14,6 +14,7 @@ import fcntl
 import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 from collections import Counter
@@ -150,21 +151,10 @@ def expected_strings(cases: Sequence[Case]) -> set[str]:
     return found
 
 
-def quotes_expected(shown: str, values: set[str]) -> bool:
-    """A string of four characters or more inside the text, or a shorter one that is the whole text."""
-    return any(value in shown if len(value) >= MIN_EXPECTED_STRING else value == shown.strip() for value in values)
-
-
-def judge_rule(rule: Any, text: str, *, max_bytes: int, batch_values: set[str], run_values: set[str],
-               secrets: Sequence[str]) -> str | None:
-    """The reason a rule is refused, or None, against the file as it stands.
-
-    ``batch_values`` are the expected values of the batch (requirement 5). ``run_values`` are those of every failed
-    case of the run: a rule quoting one is also refused, because the log must never hold such a text and the log is
-    what a resumed run replays the kept rules from.
-    """
+def judge_rule(rule: Any, text: str, *, max_bytes: int, batch_values: set[str], secrets: Sequence[str]) -> str | None:
+    """The reason a rule is refused, or None, against the file as it stands (requirement 5)."""
     shown = rule if isinstance(rule, str) else canonical(rule)
-    if quotes_expected(shown, {v for v in batch_values if len(v) >= MIN_EXPECTED_STRING}) or quotes_expected(shown, run_values):
+    if any(len(value) >= MIN_EXPECTED_STRING and value in shown for value in batch_values):
         return "expected-value"
     if any(secret in shown for secret in secrets):
         return "contains-key"
@@ -178,7 +168,7 @@ def judge_rule(rule: Any, text: str, *, max_bytes: int, batch_values: set[str], 
         return "not-single-line"
     if len(rule) > MAX_RULE_CHARACTERS:
         return "too-long"
-    if rule.strip() in {line.strip() for line in text.splitlines()}:
+    if rule in text.splitlines():
         return "duplicate"
     size = len(text.encode("utf-8")) + grow
     if size > max_bytes:
@@ -186,6 +176,11 @@ def judge_rule(rule: Any, text: str, *, max_bytes: int, batch_values: set[str], 
     if size > MAX_INSTRUCTION_BYTES:
         return "over-runner-limit"
     return None
+
+
+def holds_expected(shown: str, run_values: set[str]) -> bool:
+    """Whether a text holds an expected value of the run (two characters or more), so the log must not hold it."""
+    return any(len(value) >= 2 and value in shown for value in run_values)
 
 
 def append_rule(text: str, rule: str) -> str:
@@ -295,6 +290,9 @@ class Log:
                 break
             data += chunk
         complete = data[:data.rfind(b"\n") + 1]  # a last line without its newline was cut short
+        tail = data[len(complete):]
+        if tail and not any(tail.startswith(mark) or mark.startswith(tail) for mark in (b'{"header": ', b'{"batch": ', b'{"totals": ')):
+            raise Refused(f"the log {self.path} is not a log of this command")
         header, batches, finished = None, [], False
         for number, line in enumerate(complete.splitlines()):
             try:
@@ -321,19 +319,27 @@ class Log:
             os.fsync(self.fd)
 
     def append(self, entry: Mapping[str, Any]) -> None:
-        os.write(self.fd, (json.dumps(entry, ensure_ascii=True) + "\n").encode("ascii"))
+        data = memoryview((json.dumps(entry, ensure_ascii=True) + "\n").encode("ascii"))
+        while data:  # a short write is finished before anything else is done
+            data = data[os.write(self.fd, data):]
         os.fsync(self.fd)
 
 
 def write_output(path: Path, text: str) -> None:
     """Replace OUT atomically through a new, exclusively created temporary file in its directory."""
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)  # an existing file keeps its permissions
+    except OSError:
+        mask = os.umask(0)
+        os.umask(mask)
+        mode = 0o666 & ~mask
     descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(text.encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(name, 0o644)
+        os.chmod(name, mode)
         os.replace(name, path)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -361,6 +367,8 @@ def run_learning(args: argparse.Namespace, environment: Mapping[str, str], send:
     if not api_key:
         raise Refused(f"{key_name} is not set")
     secrets = [value for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY") if (value := environment.get(name))]
+    if any(secret in args.writer_model for secret in secrets):
+        raise Refused("--writer-model contains an API key; it would be written to the log")
     if any(secret in original for secret in secrets):
         raise Refused(f"{args.instructions} contains an API key; it would be copied and sent to the writer")
     identity = identity_of(args, file_bytes, args.run_dir, provider, failures)
@@ -380,6 +388,16 @@ def run_learning(args: argparse.Namespace, environment: Mapping[str, str], send:
         log.close()
 
 
+def kept_text(rule: dict[str, Any], lines: dict[str, str], where: Path) -> str:
+    """The text of a kept rule: in the log, or, when the log withholds it, the line of OUT with that digest."""
+    if isinstance(rule.get("text"), str):
+        return rule["text"]
+    line = lines.get(rule.get("sha256")) if isinstance(rule.get("sha256"), str) else None
+    if line is None:
+        raise Refused(f"{where} holds a kept rule whose text it withholds and the output does not hold; use new files")
+    return line
+
+
 def run_locked(args: argparse.Namespace, log: Log, send: Send, provider: str,
                batches: list[list[tuple[Case, dict[str, Any], str]]], identity: dict[str, Any],
                file_bytes: bytes, original: str, api_key: str, secrets: Sequence[str]) -> int:
@@ -388,6 +406,13 @@ def run_locked(args: argparse.Namespace, log: Log, send: Send, provider: str,
     # an interruption: all logged batches applied, or all but the last.
     if header is not None and header != identity:
         raise Refused(f"{args.log} was written with other inputs or options; use new files")
+    current = None
+    if args.output.exists():
+        try:
+            current = args.output.read_bytes().decode("utf-8")
+        except (OSError, ValueError):
+            raise Refused(f"{args.output} cannot be read as text; use new files") from None
+    lines = {sha256(line): line for line in (current or "").splitlines()}
     versions = [original]
     for number, entry in enumerate(logged):
         if entry.get("batch") != number or number >= len(batches) or \
@@ -396,17 +421,9 @@ def run_locked(args: argparse.Namespace, log: Log, send: Send, provider: str,
         text = versions[-1]
         for rule in entry["rules"]:
             if isinstance(rule, dict) and rule.get("kept"):
-                if not isinstance(rule.get("text"), str):
-                    raise Refused(f"{args.log} holds a kept rule without its text; use new files")
-                text = append_rule(text, rule["text"])
+                text = append_rule(text, kept_text(rule, lines, args.log))
         versions.append(text)
     text = versions[-1]
-    current = None
-    if args.output.exists():
-        try:
-            current = args.output.read_bytes().decode("utf-8")
-        except (OSError, ValueError):
-            raise Refused(f"{args.output} cannot be read as text; use new files") from None
     allowed = [versions[-1]] if finished else versions[-2:]
     if current is not None and current not in allowed:
         raise Refused(f"{args.output} is not what the log says it should hold; use new files")
@@ -451,13 +468,16 @@ def learn_batch(number: int, batch: Sequence[tuple[Case, dict[str, Any], str]], 
     batch_values = expected_strings(cases)  # first read of the expected answers, after the writer has replied
     rules = []
     for rule in returned or []:
-        reason = judge_rule(rule, text, max_bytes=args.max_bytes, batch_values=batch_values, run_values=run_values,
-                            secrets=secrets)
+        reason = judge_rule(rule, text, max_bytes=args.max_bytes, batch_values=batch_values, secrets=secrets)
         shown = rule if isinstance(rule, str) else canonical(rule)
         if reason in SECRET_REASONS:
             rules.append({"sha256": sha256(shown), "length": len(shown), "kept": False, "refused": reason})
             continue
-        rules.append({"text": shown, "kept": reason is None, "refused": reason})
+        if holds_expected(shown, run_values):  # not retention: the log never holds such a text, kept or not
+            rules.append({"sha256": sha256(shown), "length": len(shown), "kept": reason is None, "refused": reason,
+                          "text_withheld": True})
+        else:
+            rules.append({"text": shown, "kept": reason is None, "refused": reason})
         if reason is None:
             text = append_rule(text, rule)
     entry = {
