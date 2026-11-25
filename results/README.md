@@ -9,3 +9,4 @@ Each folder holds one set of benchmark runs: the records, the run parameters and
 | [learned-instruction](learned-instruction/README.md) | A learning loop's instruction against the hand-written one on `gpt-6-sol`: development, validation and held-out parts | November 25, 2026 |
 | [instruction-ladder](instruction-ladder/README.md) | The hand-written instruction on `claude-opus-5-5`, `gpt-6.1-terra` and `gpt-6-luna`, validation part, with and without | November 25, 2026 |
 | [instruction-full](instruction-full/README.md) | Every single-turn BFCL case on `gpt-6-sol` and `claude-opus-5-5` with the hand-written instruction, against Phase 0 | November 25, 2026 |
+| [instruction-six-models](instruction-six-models/README.md) | Every single-turn BFCL case, raw and with the hand-written instruction, on `gpt-6.1-terra`, `gpt-6-luna`, `claude-sonnet-5-5` and `claude-haiku-5-5`; one table across six models | November 25, 2026 |
