@@ -140,17 +140,23 @@ class Store:
         """A stop in the middle of an append leaves a last line without its newline.
 
         The next append would join it, and the joined line would be unreadable: the new entry lost.
-        A newline ends the torn line on its own (a whole entry that lacked only the newline becomes
-        readable); an unreadable one stays an ignored line of its own.
+        A whole entry that lacked only the newline gets its newline; an unreadable fragment is
+        truncated, so the journal stays valid JSON lines (nothing in it was committed).
         """
         path = self.directory / CONVERSATIONS_FILE
         if path.exists() and path.stat().st_size:
             with path.open("rb+") as file:
-                file.seek(-1, os.SEEK_END)
-                if file.read(1) != b"\n":
+                data = file.read()
+                if data.endswith(b"\n"):
+                    return
+                start = data.rfind(b"\n") + 1
+                try:
+                    json.loads(data[start:])
                     file.write(b"\n")
-                    file.flush()
-                    os.fsync(file.fileno())
+                except ValueError:
+                    file.truncate(start)
+                file.flush()
+                os.fsync(file.fileno())
 
     def _write_records(self) -> None:
         _write_atomically(self.directory / RECORDS_FILE, "".join(json.dumps(r) + "\n" for r in self.records.values()))

@@ -584,7 +584,16 @@ class ResumeTests(Base):
         self.run_retail(send=ScriptedAgent(TASK))
         entries = batch.read_jsonl(journal)
         self.assertEqual([(e["task_id"], e["outcome"]) for e in entries], [(TASK_ID, "pass")])  # the retry's transcript is readable
-        self.assertTrue(journal.read_text().startswith('{"task_id": \n'))
+        for line in journal.read_text().splitlines():
+            json.loads(line)  # the torn fragment was truncated, not kept
+
+    def test_a_complete_final_entry_lacking_only_its_newline_is_kept(self):
+        self.run_retail()
+        journal = self.directory / batch.CONVERSATIONS_FILE
+        journal.write_text(journal.read_text().rstrip("\n"))
+        batch.Store(self.directory)
+        self.assertTrue(journal.read_text().endswith("\n"))
+        self.assertEqual(len(batch.read_jsonl(journal)), 1)
 
     def test_a_torn_tail_then_a_stop_before_the_index_is_written_does_not_repeat_the_trial(self):
         class Stopped(BaseException):
