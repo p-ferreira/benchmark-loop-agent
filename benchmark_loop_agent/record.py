@@ -29,6 +29,10 @@ class Record:
     latency_seconds: float | None  # None when no request was made
     input_tokens: int | None  # None when the response did not report usage
     output_tokens: int | None
+    # The text the model wrote: its text parts joined in order, cut to 4,000
+    # characters; "" when it wrote none; None when unscored (and in records of
+    # earlier runs, which lack the field).
+    reply_text: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """The record as strictly valid JSON data (see ``json_safe``)."""

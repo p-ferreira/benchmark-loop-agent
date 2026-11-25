@@ -15,6 +15,7 @@ from .tracing import API_KEY_ENV
 from .scoring import SCORER_REVISION, ReferenceDataError, score_calls
 
 MAX_REASON_LENGTH = 500
+MAX_REPLY_TEXT_LENGTH = 4000
 
 
 @dataclass(frozen=True)
@@ -23,7 +24,7 @@ class Provider:
 
     key_env: str
     model_env: str
-    request: Callable[[str, str, Case, Send], ProviderResponse]
+    request: Callable[..., ProviderResponse]  # (api key, model, case, send, instruction)
 
 
 PROVIDERS: dict[str, Provider] = {
@@ -56,7 +57,7 @@ def redact_record(record: Record, secrets: Sequence[str]) -> Record:
 
 def run_provider(
     name: str, case: Case, environment: Mapping[str, str], send: Send,
-    scored: Callable[[int, int], None] | None = None,
+    scored: Callable[[int, int], None] | None = None, instruction: str | None = None,
 ) -> Record:
     """Run the case against one provider and return its record. Never raises."""
     provider = PROVIDERS[name]
@@ -83,6 +84,9 @@ def run_provider(
             latency_seconds=latency,
             input_tokens=response.input_tokens if response else None,
             output_tokens=response.output_tokens if response else None,
+            # Redact first, then cut, for the same reason as the reasons.
+            reply_text=redact(response.reply_text, secrets)[:MAX_REPLY_TEXT_LENGTH]
+            if response and outcome != "unscored" else None,
         ), secrets)
 
     if api_key is None:
@@ -92,7 +96,7 @@ def run_provider(
 
     started = time.perf_counter()
     try:
-        response = provider.request(api_key, model, case, send)
+        response = provider.request(api_key, model, case, send, instruction)
     except Exception as error:  # any failure of the call is "unscored", never a crash
         return record("unscored", [f"{type(error).__name__}: {error}"], latency=time.perf_counter() - started)
     latency = time.perf_counter() - started

@@ -52,6 +52,8 @@ Running the same command again on the same `--output-dir` resumes the run.
 | `--split PART` | `development`, `validation` or `held-out`: run only that part's cases of [`data/split.json`](#development-validation-and-held-out-split). Combines with `--categories`, `--sample-size` and `--seed` (the sample is drawn inside the part). Written in `run.json`; resuming with another part is refused. Without it nothing changes |
 | `--provider P` | `openai` or `anthropic`; repeat for both (default: both) |
 | `--openai-model ID`, `--anthropic-model ID` | model IDs; otherwise `OPENAI_MODEL` / `ANTHROPIC_MODEL`. No default in code: a provider without one is `unscored` |
+| `--instructions FILE` | a UTF-8 text file of 1 to 8,000 bytes whose text goes first in every request, for each provider without its own file; see [Instruction file](#instruction-file) |
+| `--openai-instructions FILE`, `--anthropic-instructions FILE` | the same for one provider; they win over `--instructions` for it |
 | `--concurrency N` | requests in flight at once (default `4`) |
 
 ### Exit code
@@ -125,6 +127,29 @@ table):
 | held-out | 1092 | 604 |
 | **Total** | 3641 | 1864 |
 
+## Instruction file
+
+`--instructions FILE` puts the file's text in the system position of every
+request of the run: for OpenAI as a `developer` message placed first in the
+input, for Anthropic in the `system` field. When a case already has a system
+message, the instruction comes first and the case's own system text follows,
+unchanged (for Anthropic as a second `system` block). `--openai-instructions`
+and `--anthropic-instructions` give one provider its own file;
+`--instructions` is the default for a provider without one.
+
+* A file above 8,000 bytes, an empty file and a file that is not valid UTF-8
+  are refused before any request.
+* `run.json` records, per provider of the run, the SHA-256 and byte length of
+  the file, and the text itself is saved beside it as
+  `instruction-<provider>.txt`. Resuming a directory with another text, or with
+  one where there was none, is refused like any other changed parameter.
+* Without these options every request is what it was before, and earlier runs
+  still resume.
+* The report names the digest and length, or says none was used. Repeated runs
+  with different digests are different configurations and are refused.
+* The instruction is text you wrote; no expected answer reaches a model input,
+  with or without it.
+
 ## Output directory
 
 * `records.jsonl`: one JSON Lines record per case and provider, appended as
@@ -144,6 +169,7 @@ table):
 | `case_id`, `category`, `dataset_revision`, `scorer_revision` | what was run and the pinned sources |
 | `returned_calls` | tool calls as `{function: {param: value}}`; `null` when unscored. A non-finite number (e.g. `1e400`) is written as `{"unrepresentable_number": "Infinity"}` so the line stays strict JSON |
 | `outcome` | `pass`, `fail` (response arrived; answer wrong, or the checker could not judge it, with the reason) or `unscored` (the API call failed, including a missing key or model) |
+| `reply_text` | the text the model wrote: its text parts joined in order, cut to 4,000 characters; `""` when it wrote none; `null` when unscored. Records of earlier runs lack it and still load, report and resume |
 | `reasons` | why it failed or was not scored; empty on pass |
 | `latency_seconds` | request time including any retry waits; `null` if no request was made |
 | `input_tokens`, `output_tokens` | usage as the response reports it, else `null` |
@@ -325,6 +351,23 @@ directory unless `--output-dir` says otherwise. A report holds:
   `run.json` does not record the selection shows the figure as unavailable.
   A `--split` run reports, and names, its part; a run without `--split` is not
   broken down by part;
+* the **failure classes**: every failed case has exactly one class, per
+  category and overall, as counts. The first that applies is the case's class:
+  * `called-when-none-applied`: a failure in `irrelevance` or `live_irrelevance`;
+  * `malformed-call`: in any other category, a returned call could not be
+    scored (arguments that are not a JSON object, or nested too deep), before
+    the checker saw it;
+  * `no-call`: at least one call was expected and the model returned none;
+  * `too-few-calls`, `too-many-calls`: at least one call came back, and fewer
+    or more than the expected answer holds;
+  * `wrong-call`: the number of calls is the expected one and the checker
+    rejected a name, a parameter, a type or a value.
+
+  `live_relevance` has no expected answer; there at least one call is expected,
+  so its failures are `malformed-call` or `no-call`. The class is computed from
+  the record and the expected answer when the report is built; it is not stored
+  in the record. Unscored cases are not failures and stay apart;
+* the instruction's digest and length, or that none was used;
 * input and output tokens, and the cases without reported usage, counted and
   named (their tokens are not estimated);
 * cost, from `data/rates.json`: input and output tokens at the rate of the
@@ -345,6 +388,24 @@ directory unless `--output-dir` says otherwise. A report holds:
   (the selection size is saved in `run.json`), or a last invocation that never
   ended). A record with only one token count still contributes that count; cases
   missing either are all named, with the missing one.
+
+### Comparing two runs
+
+```sh
+uv run --locked python -m benchmark_loop_agent.report --compare DIR_A DIR_B --output-dir DIR
+```
+
+Writes `compare-<provider>.md` for each provider both directories hold, never
+pairing a case across providers; it is refused when they share no provider.
+It compares the cases both runs selected (a full run can be compared with a run
+of one `--split` part), states how many cases only A and only B selected, and is
+refused when they share no case. Per category and overall it gives the cases
+only A passed, the cases only B passed, and how many paired cases moved from
+each failure class to each other class or to a pass. A case that is unscored, or
+has no record, in a run is not paired: it is counted in a line per run and per
+category, so the paired counts and those lines account for every compared case.
+Each run's model and instruction digest are named. The cases a run selected are
+recomputed from its parameters and checked against the digest in its `run.json`.
 
 ### Repeated runs
 

@@ -11,7 +11,8 @@ from typing import Any, Sequence
 from .comparison import OVERALL, comparison_counts
 from .store import selection_fingerprint
 
-CONFIGURATION_KEYS = ("providers", "models", "split", "categories", "sample_size", "seed")
+# "instructions" holds each provider's instruction digest, so runs given different texts differ.
+CONFIGURATION_KEYS = ("providers", "models", "split", "categories", "sample_size", "seed", "instructions")
 
 
 def configuration(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -88,11 +89,12 @@ def _percent(value: float | None) -> str:
 
 
 def render_spread(provider: str, model: str | None, split: str | None, names: Sequence[str],
-                  table: dict[str, dict[str, Any]]) -> str:
+                  table: dict[str, dict[str, Any]], instruction: str | None = None) -> str:
     """Markdown for one provider's repeated-run figures."""
     out = [f"# Repeated runs: `{model or 'model not set'}` ({provider})", "",
            f"* Part: {split or 'every case (no --split)'}",
-           f"* Runs: {len(names)} ({', '.join(f'`{n}`' for n in names)})", "",
+           f"* Runs: {len(names)} ({', '.join(f'`{n}`' for n in names)})",
+           *([instruction] if instruction else []), "",
            "The comparison figure is passes divided by the cases each run selected, so unscored and missing "
            "cases count against it. Lowest, highest and mean are over the runs; **Overall** is each run's pooled "
            "figure, not the mean of the category figures.", "",
