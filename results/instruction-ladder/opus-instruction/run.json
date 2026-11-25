@@ -1,0 +1,62 @@
+{
+  "parameters": {
+    "categories": [
+      "simple_python",
+      "simple_java",
+      "simple_javascript",
+      "multiple",
+      "parallel",
+      "parallel_multiple",
+      "irrelevance",
+      "live_simple",
+      "live_multiple",
+      "live_parallel",
+      "live_parallel_multiple",
+      "live_irrelevance",
+      "live_relevance"
+    ],
+    "sample_size": null,
+    "seed": 0,
+    "providers": [
+      "anthropic"
+    ],
+    "models": {
+      "anthropic": "claude-opus-5-5"
+    },
+    "split": "validation",
+    "instructions": {
+      "anthropic": {
+        "sha256": "0f7c3d7a9ef588991ee546081c3d23d3e6b972a4fb86e6fab57858c3ab4ffec9",
+        "bytes": 604
+      }
+    }
+  },
+  "dataset_revision": "ShishirPatil/gorilla@6ea57973c7a6097fd7c5915698c54c17c5b1b6c8",
+  "scorer_revision": "ShishirPatil/gorilla@6ea57973c7a6097fd7c5915698c54c17c5b1b6c8:berkeley-function-call-leaderboard/bfcl_eval/eval_checker (ast_checker.py, eval_runner.py rules)",
+  "selection": {
+    "simple_python": 80,
+    "simple_java": 20,
+    "simple_javascript": 10,
+    "multiple": 40,
+    "parallel": 40,
+    "parallel_multiple": 40,
+    "irrelevance": 48,
+    "live_simple": 52,
+    "live_multiple": 211,
+    "live_parallel": 3,
+    "live_parallel_multiple": 5,
+    "live_irrelevance": 177,
+    "live_relevance": 3
+  },
+  "selection_fingerprint": "692e71b08d2e6fe63d894053a1b1a6bfcd6eb8b40d7be68b13c37ed750dcb9c2",
+  "run_id": "8a7a7daeb9ca4eff84c058fe43a74778",
+  "sessions": [
+    {
+      "number": 1,
+      "concurrency": 8,
+      "started_at": "2026-11-25T19:29:50+00:00",
+      "ended_at": "2026-11-25T19:32:38+00:00",
+      "wall_seconds": 168.575
+    }
+  ]
+}
