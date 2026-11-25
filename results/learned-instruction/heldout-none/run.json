@@ -1,0 +1,56 @@
+{
+  "parameters": {
+    "categories": [
+      "simple_python",
+      "simple_java",
+      "simple_javascript",
+      "multiple",
+      "parallel",
+      "parallel_multiple",
+      "irrelevance",
+      "live_simple",
+      "live_multiple",
+      "live_parallel",
+      "live_parallel_multiple",
+      "live_irrelevance",
+      "live_relevance"
+    ],
+    "sample_size": null,
+    "seed": 0,
+    "providers": [
+      "openai"
+    ],
+    "models": {
+      "openai": "gpt-6-sol"
+    },
+    "split": "held-out"
+  },
+  "dataset_revision": "ShishirPatil/gorilla@6ea57973c7a6097fd7c5915698c54c17c5b1b6c8",
+  "scorer_revision": "ShishirPatil/gorilla@6ea57973c7a6097fd7c5915698c54c17c5b1b6c8:berkeley-function-call-leaderboard/bfcl_eval/eval_checker (ast_checker.py, eval_runner.py rules)",
+  "selection": {
+    "simple_python": 120,
+    "simple_java": 30,
+    "simple_javascript": 15,
+    "multiple": 60,
+    "parallel": 60,
+    "parallel_multiple": 60,
+    "irrelevance": 72,
+    "live_simple": 77,
+    "live_multiple": 316,
+    "live_parallel": 5,
+    "live_parallel_multiple": 7,
+    "live_irrelevance": 265,
+    "live_relevance": 5
+  },
+  "selection_fingerprint": "2f732ea4e55a3dbadf8309af62ca14499f8aa4234cd2347be050b9fc852b62f1",
+  "run_id": "7a0643081a8c46388d0c55412c986409",
+  "sessions": [
+    {
+      "number": 1,
+      "concurrency": 8,
+      "started_at": "2026-11-25T18:55:59+00:00",
+      "ended_at": "2026-11-25T18:59:20+00:00",
+      "wall_seconds": 201.346
+    }
+  ]
+}
