@@ -187,23 +187,28 @@ model returned are sent as they are, even where they equal an expected value. A 
 cases unique marker strings and fails if any request holds one.
 
 **What is kept.** `OUT` starts as an exact copy of `FILE`; each rule is appended as its own line, as written, unless
-it is refused (reasons in the log): `not-single-line`, `invalid-text`, `too-long` (over 300 characters), `duplicate`
-(already in the file), `over-batch-limit`, `over-max-bytes`, `over-runner-limit` (past 8,000 bytes),
+it is refused (reasons in the log): `not-single-line` (any line break, also a trailing or Unicode one), `invalid-text`, `too-long` (over 300 characters), `duplicate`
+(already in the file), `over-max-bytes`, `over-runner-limit` (past 8,000 bytes),
 `expected-value` (it contains, as written, an expected string value of four characters or more from a case of its
-batch; checked by code that reads the answers after the writer has replied) and `contains-key`. Nothing already in
+batch; checked by code that reads the answers after the writer has replied; a rule that quotes an expected value of any
+failed case of the run is refused the same way, because the log must never hold such a text) and `contains-key`.
+The number of rules asked for is a request, not a ground for refusal. Nothing already in
 the file is changed or removed.
 
-**The log** has one JSON line per batch (SHA-256 of each case identifier, the writer as requested and as reported,
-SHA-256 of the request, every rule with whether it was kept and why not, tokens, and the inputs and options the batch
-was made with) and a final line of totals (batches, rules returned, kept and refused by reason, tokens, SHA-256 and
+**The log** starts with a header line holding the inputs and options of the run (digests of the run files, `FILE`,
+the question and answer content of the failed cases, the writer and the limits), written before the first request.
+It has one JSON line per batch (SHA-256 of each case identifier, the writer's provider and model as requested and as reported (`null` when the reply does not report one),
+SHA-256 of the request, every rule with whether it was kept and why not, tokens) and a final line of totals (batches, rules returned, kept and refused by reason, tokens, SHA-256 and
 byte length of `FILE` and `OUT`). A rule refused for an expected value or a key is logged as its SHA-256 and length
-only. The log holds no expected value and no key.
+only. The log holds no expected value and no key. It is only appended to; the one thing ever cut is a last line left unfinished by an interruption. It is locked while a run uses it.
 
 **Refusals (exit code 2, before any request).** A run that is not `--split development`; a run of several providers
 or of none; any record, passing or not, whose case is not in the development part of `data/split.json`; a failed
 record whose failure class cannot be found; an unreadable, empty, over-8,000-byte or non-UTF-8 `FILE`; a missing
-key; an `OUT` or log that already exists but was made with other inputs or options (run, `FILE`, writer, limits), or
-that has been edited since.
+key, or a key inside `FILE`; an unreadable `run.json`; an `OUT` or log that already exists but was made with other inputs or
+options (run, `FILE`, question and answer content, writer, limits), an `OUT` that is neither the complete output of
+the logged batches nor the version before the last one, or a log in use by another run. All of this is checked before
+anything is written.
 
 **Running it again** with the same inputs and options sends no batch that is already in the log and continues after
 it. Learning needs the answer files for the failure classes, like the report does.

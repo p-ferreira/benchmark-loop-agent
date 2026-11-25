@@ -93,8 +93,14 @@ class LearnTest(unittest.TestCase):
             code = learn.main(argv or self.argv(), send=send, environment=ENV if env is None else env)
         return code, send, err.getvalue()
 
-    def log(self):
+    def log_lines(self):
         return [json.loads(line) for line in Path(str(self.out) + ".log.jsonl").read_text().splitlines()]
+
+    def log(self):
+        return self.log_lines()[1:]  # after the header line
+
+    def header(self):
+        return self.log_lines()[0]["header"]
 
 
 class RequestContentTests(LearnTest):
@@ -178,8 +184,8 @@ class KeepingTests(LearnTest):
         self.assertEqual(code, 0)
         entry = self.log()[0]
         reasons = [r["refused"] for r in entry["rules"]]
-        self.assertEqual(reasons, [None, "not-single-line", "too-long", "duplicate", "expected-value", "contains-key", "over-batch-limit"])
-        self.assertEqual(self.out.read_text(), START + "  Keep it short. \n")
+        self.assertEqual(reasons, [None, "not-single-line", "too-long", "duplicate", "expected-value", "contains-key", None])
+        self.assertEqual(self.out.read_text(), START + "  Keep it short. \nAsk when unsure.\n")
         self.assertNotIn("text", entry["rules"][4])
         self.assertEqual(entry["rules"][4]["sha256"], sha(f"Say {marker} first"))
         self.assertEqual(entry["rules"][4]["length"], len(f"Say {marker} first"))
@@ -188,11 +194,37 @@ class KeepingTests(LearnTest):
         self.assertNotIn(WRITER_KEY, logtext)
         self.assertNotIn(ENV["ANTHROPIC_API_KEY"], logtext)
 
-    def test_an_expected_value_of_a_case_of_the_batch_only(self) -> None:
-        other = self.markers[self.failed[4].case_id]  # batch 2 of 3, not batch 0
+    def test_an_expected_value_of_a_case_of_another_batch_is_refused_and_never_logged(self) -> None:
+        other = self.markers[self.failed[4].case_id]  # a case of batch 2 of 3, returned in batch 0
         self.run_cli([f"Mention {other}"], argv=self.argv(batch_size=2))
-        self.assertTrue(self.log()[0]["rules"][0]["kept"])
-        self.assertEqual(self.log()[2]["rules"][0]["refused"], "expected-value")  # batch 2 holds that case
+        rule = self.log()[0]["rules"][0]
+        self.assertEqual((rule["kept"], rule["refused"]), (False, "expected-value"))
+        self.assertNotIn("text", rule)
+        self.assertNotIn(other, Path(str(self.out) + ".log.jsonl").read_text())
+        self.assertNotIn(other, self.out.read_text())
+        self.assertEqual(self.log()[2]["rules"][0]["refused"], "expected-value")
+
+    def test_a_short_expected_value_that_is_the_whole_rule_is_not_logged(self) -> None:
+        rows = [json.loads(line) for line in (dataset.DATA_DIR / "answers" / "BFCL_v4_simple_python.json").read_text().splitlines()]
+        for row in rows:
+            if row["id"] == self.failed[4].case_id:
+                (name, options), = row["ground_truth"][0].items()
+                options[next(iter(options))].append("zq9")
+        (dataset.DATA_DIR / "answers" / "BFCL_v4_simple_python.json").write_text("".join(json.dumps(r) + "\n" for r in rows))
+        dataset.load_expected_answers.cache_clear()
+        self.run_cli(["zq9"], argv=self.argv(batch_size=2))
+        self.assertNotIn("zq9", Path(str(self.out) + ".log.jsonl").read_text())
+        self.assertEqual(self.log()[0]["rules"][0]["refused"], "expected-value")
+
+    def test_unicode_line_breaks_make_a_rule_not_single_line(self) -> None:
+        rules = ["Ends with a separator. ", "Ends with a paragraph. ", "Ends with form feed.\x0c", "Fine."]
+        self.run_cli(rules, argv=self.argv(batch_size=10))
+        self.assertEqual([r["refused"] for r in self.log()[0]["rules"]], ["not-single-line"] * 3 + [None])
+        self.assertEqual(self.out.read_text(), START + "Fine.\n")
+
+    def test_a_valid_rule_after_an_invalid_one_is_kept_whatever_the_limit(self) -> None:
+        self.run_cli(["bad\nrule", "Good rule."], argv=self.argv(batch_size=10, lines_per_batch=1))
+        self.assertEqual([r["refused"] for r in self.log()[0]["rules"]], ["not-single-line", None])
 
     def test_size_limits(self) -> None:
         code, _, _ = self.run_cli(["a" * 100, "b" * 100], argv=self.argv(max_bytes=len(START) + 101, batch_size=10))
@@ -219,7 +251,7 @@ class KeepingTests(LearnTest):
         self.run_cli(["Rule A.", "Rule A."], argv=self.argv(batch_size=10))
         batch, totals = self.log()
         self.assertEqual(batch["case_sha256"], [sha(c.case_id) for c in self.failed])
-        self.assertEqual(batch["writer"], {"provider": "openai", "model_requested": "writer-model", "model_reported": "writer-actual"})
+        self.assertEqual(batch["writer"], {"provider_requested": "openai", "provider_reported": None, "model_requested": "writer-model", "model_reported": "writer-actual"})
         self.assertEqual(len(batch["request_sha256"]), 64)
         self.assertEqual((batch["input_tokens"], batch["output_tokens"]), (11, 5))
         self.assertEqual(totals["totals"], {
@@ -328,6 +360,83 @@ class ResumeTests(LearnTest):
         self.assertEqual(code, 3)
         self.assertEqual(self.out.read_text(), START)
         self.assertEqual(self.log(), [])
+
+    def test_the_header_holds_the_identity_before_any_request(self) -> None:
+        code, _, _ = self.run_cli(None, send=FakeSend(RuntimeError("boom")))
+        self.assertEqual(code, 3)
+        self.assertEqual(self.header()["writer_model"], "writer-model")
+        code, send, _ = self.run_cli([], argv=self.argv(writer_model="other"))
+        self.assertEqual((code, send.requests), (2, []))
+
+    def test_a_refused_rerun_leaves_the_log_untouched(self) -> None:
+        self.run_cli(["Rule A."])
+        log = Path(str(self.out) + ".log.jsonl")
+        before = (log.read_bytes(), self.out.read_bytes())
+        code, send, _ = self.run_cli([], argv=self.argv(max_bytes=3000))
+        self.assertEqual((code, send.requests), (2, []))
+        self.assertEqual((log.read_bytes(), self.out.read_bytes()), before)
+
+    def test_an_interruption_after_the_last_batch_is_finished_without_sending(self) -> None:
+        self.run_cli([])
+        log = Path(str(self.out) + ".log.jsonl")
+        lines = log.read_bytes().splitlines(keepends=True)
+        log.write_bytes(b"".join(lines[:-1]) + lines[-1][:10])  # totals cut short
+        code, send, _ = self.run_cli([])
+        self.assertEqual((code, send.requests), (0, []))
+        self.assertIn("totals", self.log_lines()[-1])
+
+    def test_an_output_one_version_behind_is_repaired_but_an_empty_one_is_refused(self) -> None:
+        self.run_cli(["Rule A."], argv=self.argv(batch_size=10))
+        log = Path(str(self.out) + ".log.jsonl")
+        lines = log.read_bytes().splitlines(keepends=True)
+        log.write_bytes(b"".join(lines[:-1]))  # no totals
+        self.out.write_text(START)  # the version before the last batch
+        code, send, _ = self.run_cli([], argv=self.argv(batch_size=10))
+        self.assertEqual((code, send.requests), (0, []))
+        self.assertEqual(self.out.read_text(), START + "Rule A.\n")
+        log.write_bytes(b"".join(lines[:-1]))
+        self.out.write_text("")
+        code, send, _ = self.run_cli([], argv=self.argv(batch_size=10))
+        self.assertEqual((code, send.requests), (2, []))
+
+    def test_a_changed_question_is_another_input(self) -> None:
+        self.run_cli(["Rule A."])
+        original = dataset.load_cases
+
+        def changed(category):
+            return [dataset.Case(**{**c.__dict__, "messages": [{"role": "user", "content": "changed"}]}) if c.case_id == self.failed[0].case_id else c
+                    for c in original(category)]
+
+        with mock.patch.object(learn, "load_cases", changed):
+            code, send, _ = self.run_cli([])
+        self.assertEqual((code, send.requests), (2, []))
+
+    def test_a_truncated_manifest_is_refused(self) -> None:
+        (self.run_dir / "run.json").write_text('{"parameters": {"provid')
+        code, send, _ = self.run_cli([])
+        self.assertEqual((code, send.requests), (2, []))
+
+    def test_a_key_in_the_instruction_file_is_refused_before_any_file_exists(self) -> None:
+        self.instructions.write_text(START + f"key {WRITER_KEY}\n")
+        code, send, _ = self.run_cli([])
+        self.assertEqual((code, send.requests), (2, []))
+        self.assertFalse(self.out.exists())
+
+    def test_a_temporary_looking_input_is_never_replaced(self) -> None:
+        start = self.tmp / "learned.txt.tmp"
+        start.write_text(START)
+        out = self.tmp / "learned.txt"
+        code, _, _ = self.run_cli(["Rule A."], argv=self.argv(instructions=start, output=out))
+        self.assertEqual(code, 0)
+        self.assertEqual(start.read_text(), START)
+        self.assertEqual(out.read_text(), START + "Rule A.\n")
+
+    def test_a_log_in_use_is_refused(self) -> None:
+        self.run_cli([])
+        log = learn.Log(Path(str(self.out) + ".log.jsonl"), create=False)
+        self.addCleanup(log.close)
+        code, send, _ = self.run_cli([])
+        self.assertEqual((code, send.requests), (2, []))
 
 
 if __name__ == "__main__":

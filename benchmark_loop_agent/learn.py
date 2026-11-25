@@ -9,10 +9,13 @@ Exit codes: 0 done, 2 refused (bad usage or inputs, before any request), 3 a wri
 """
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -37,7 +40,7 @@ WRITER_PROVIDERS = ("openai", "anthropic")
 
 KEPT = "kept"
 REASONS = ("expected-value", "contains-key", "invalid-text", "not-single-line", "too-long", "duplicate",
-           "over-batch-limit", "over-max-bytes", "over-runner-limit")
+           "over-max-bytes", "over-runner-limit")
 SECRET_REASONS = ("expected-value", "contains-key")  # logged as a digest and a length, never as text
 
 
@@ -130,7 +133,7 @@ def parse_rules(text: str) -> list[Any] | None:
 # ---------------------------------------------------------------- what is kept
 
 def expected_strings(cases: Sequence[Case]) -> set[str]:
-    """Every expected string value of four characters or more in these cases. Read only after the writer replied."""
+    """Every expected string value in these cases (any length). Read only after the writer replied."""
     found: set[str] = set()
     stack: list[Any] = []
     for case in cases:
@@ -138,7 +141,7 @@ def expected_strings(cases: Sequence[Case]) -> set[str]:
     while stack:
         item = stack.pop()
         if isinstance(item, str):
-            if len(item) >= MIN_EXPECTED_STRING:
+            if item:
                 found.add(item)
         elif isinstance(item, list):
             stack.extend(item)
@@ -147,34 +150,42 @@ def expected_strings(cases: Sequence[Case]) -> set[str]:
     return found
 
 
-def judge_rule(rule: Any, text: str, index: int, *, max_bytes: int, lines_per_batch: int,
-               expected: set[str], secrets: Sequence[str]) -> tuple[str | None, int]:
-    """(reason it is refused or None, bytes the file would grow by) for one rule against the file as it stands."""
+def quotes_expected(shown: str, values: set[str]) -> bool:
+    """A string of four characters or more inside the text, or a shorter one that is the whole text."""
+    return any(value in shown if len(value) >= MIN_EXPECTED_STRING else value == shown.strip() for value in values)
+
+
+def judge_rule(rule: Any, text: str, *, max_bytes: int, batch_values: set[str], run_values: set[str],
+               secrets: Sequence[str]) -> str | None:
+    """The reason a rule is refused, or None, against the file as it stands.
+
+    ``batch_values`` are the expected values of the batch (requirement 5). ``run_values`` are those of every failed
+    case of the run: a rule quoting one is also refused, because the log must never hold such a text and the log is
+    what a resumed run replays the kept rules from.
+    """
     shown = rule if isinstance(rule, str) else canonical(rule)
-    if any(value in shown for value in expected):
-        return "expected-value", 0
+    if quotes_expected(shown, {v for v in batch_values if len(v) >= MIN_EXPECTED_STRING}) or quotes_expected(shown, run_values):
+        return "expected-value"
     if any(secret in shown for secret in secrets):
-        return "contains-key", 0
+        return "contains-key"
     if not isinstance(rule, str):
-        return "not-single-line", 0
+        return "not-single-line"
     try:
         grow = len(rule.encode("utf-8")) + 1 + (0 if not text or text.endswith("\n") else 1)
     except UnicodeEncodeError:
-        return "invalid-text", 0
-    if len(rule.splitlines()) != 1 or not rule.strip() or "\n" in rule or "\r" in rule:
-        return "not-single-line", grow
+        return "invalid-text"
+    if rule.splitlines() != [rule] or not rule.strip():  # any line break, also a trailing or Unicode one
+        return "not-single-line"
     if len(rule) > MAX_RULE_CHARACTERS:
-        return "too-long", grow
+        return "too-long"
     if rule.strip() in {line.strip() for line in text.splitlines()}:
-        return "duplicate", grow
-    if index >= lines_per_batch:
-        return "over-batch-limit", grow
+        return "duplicate"
     size = len(text.encode("utf-8")) + grow
     if size > max_bytes:
-        return "over-max-bytes", grow
+        return "over-max-bytes"
     if size > MAX_INSTRUCTION_BYTES:
-        return "over-runner-limit", grow
-    return None, grow
+        return "over-runner-limit"
+    return None
 
 
 def append_rule(text: str, rule: str) -> str:
@@ -188,10 +199,16 @@ def load_failures(run_dir: Path) -> tuple[str, list[tuple[Case, dict[str, Any], 
 
     Refuses anything but a development run of one provider, before any request.
     """
-    manifest = read_manifest(run_dir) if (run_dir / MANIFEST_FILE).is_file() else None
-    if manifest is None:
-        raise Refused(f"{run_dir} holds no {MANIFEST_FILE}")
-    parameters = manifest.get("parameters") or {}
+    try:
+        manifest = read_manifest(run_dir) if (run_dir / MANIFEST_FILE).is_file() else None
+        records = read_records(run_dir / RECORDS_FILE)
+    except (OSError, ValueError):
+        raise Refused(f"{run_dir} holds a {MANIFEST_FILE} or records file that cannot be read") from None
+    if not isinstance(manifest, dict):
+        raise Refused(f"{run_dir} holds no usable {MANIFEST_FILE}")
+    parameters = manifest.get("parameters")
+    if not isinstance(parameters, dict):
+        raise Refused(f"{run_dir} holds a {MANIFEST_FILE} without parameters")
     if parameters.get("split") != "development":
         raise Refused(f"{run_dir} is not a development run (its split is {parameters.get('split')!r}); "
                       "only a run made with --split development can be learned from")
@@ -199,7 +216,6 @@ def load_failures(run_dir: Path) -> tuple[str, list[tuple[Case, dict[str, Any], 
     if not isinstance(providers, list) or len(providers) != 1 or providers[0] not in PROVIDERS:
         raise Refused(f"{run_dir} must hold the run of exactly one provider; it records {providers!r}")
     provider = providers[0]
-    records = read_records(run_dir / RECORDS_FILE)
     development = part_case_ids("development")
     cases: dict[tuple[str, str], Case] = {}
     for record in records:
@@ -225,10 +241,18 @@ def load_failures(run_dir: Path) -> tuple[str, list[tuple[Case, dict[str, Any], 
     return provider, result
 
 
-def identity_of(args: argparse.Namespace, file_bytes: bytes, run_dir: Path) -> dict[str, Any]:
+def identity_of(args: argparse.Namespace, file_bytes: bytes, run_dir: Path, provider: str,
+                failures: Sequence[tuple[Case, dict[str, Any], str]]) -> dict[str, Any]:
+    """Everything a logged batch depends on: the run, the file, the options, and the content of the cases.
+
+    The cases enter as digests of what the request is built from (messages, functions) and of the expected answers
+    the rules are filtered against, so a changed question or answer file is another input.
+    """
     run_data = b"".join((run_dir / name).read_bytes() if (run_dir / name).is_file() else b"" for name in (MANIFEST_FILE, RECORDS_FILE))
+    content = [[case.case_id, case_block(case, record, provider, "", failure),
+                load_expected_answers(case.category).get(case.case_id)] for case, record, failure in failures]
     return {
-        "run_sha256": sha256(run_data), "instructions_sha256": sha256(file_bytes),
+        "run_sha256": sha256(run_data), "instructions_sha256": sha256(file_bytes), "cases_sha256": sha256(canonical(content)),
         "writer_provider": args.writer_provider, "writer_model": args.writer_model,
         "max_bytes": args.max_bytes, "batch_size": args.batch_size, "lines_per_batch": args.lines_per_batch,
         "request_text_sha256": sha256(fixed_request(args.lines_per_batch)),
@@ -237,49 +261,90 @@ def identity_of(args: argparse.Namespace, file_bytes: bytes, run_dir: Path) -> d
 
 # ---------------------------------------------------------------- log
 
-def read_log(path: Path) -> tuple[list[dict[str, Any]], bool]:
-    """Batch entries of a log, and whether it was finished by a totals line. Anything unreadable is refused."""
-    batches, finished = [], False
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, ValueError):
-        raise Refused(f"cannot read the log {path}") from None
-    for number, line in enumerate(lines):
+class Log:
+    """The log file, owned exclusively for the run (a lock) and only ever appended to.
+
+    The only thing ever cut off is a last line left unfinished by an interruption.
+    """
+
+    def __init__(self, path: Path, *, create: bool) -> None:
+        self.path = path
+        flags = os.O_RDWR | os.O_APPEND | (os.O_CREAT | os.O_EXCL if create else 0)
         try:
-            entry = json.loads(line)
-        except ValueError:
-            if number == len(lines) - 1:  # a line cut short by an interruption
+            self.fd = os.open(path, flags, 0o644)
+        except FileExistsError:
+            raise Refused(f"{path} was created by another run; use new files") from None
+        except OSError as error:
+            raise Refused(f"cannot open the log {path}: {error.strerror}") from None
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(self.fd)
+            raise Refused(f"{path} is in use by another run") from None
+
+    def close(self) -> None:
+        os.close(self.fd)
+
+    def read(self) -> tuple[dict[str, Any] | None, list[dict[str, Any]], bool, int]:
+        """(header, batch entries, finished by totals, length of the complete lines). Anything unreadable is refused."""
+        size = os.fstat(self.fd).st_size
+        data = b""
+        while len(data) < size:
+            chunk = os.pread(self.fd, size - len(data), len(data))
+            if not chunk:
                 break
-            raise Refused(f"the log {path} is not valid JSON Lines") from None
-        if not isinstance(entry, dict) or finished:
-            raise Refused(f"the log {path} is not a log of this command")
-        if "totals" in entry:
-            finished = True
-        elif "batch" in entry:
-            batches.append(entry)
-        else:
-            raise Refused(f"the log {path} is not a log of this command")
-    return batches, finished
+            data += chunk
+        complete = data[:data.rfind(b"\n") + 1]  # a last line without its newline was cut short
+        header, batches, finished = None, [], False
+        for number, line in enumerate(complete.splitlines()):
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                raise Refused(f"the log {self.path} is not valid JSON Lines") from None
+            if not isinstance(entry, dict) or finished:
+                raise Refused(f"the log {self.path} is not a log of this command")
+            if number == 0:
+                if not isinstance(entry.get("header"), dict):
+                    raise Refused(f"the log {self.path} is not a log of this command")
+                header = entry["header"]
+            elif "totals" in entry:
+                finished = True
+            elif "batch" in entry and isinstance(entry.get("rules"), list):
+                batches.append(entry)
+            else:
+                raise Refused(f"the log {self.path} is not a log of this command")
+        return header, batches, finished, len(complete)
 
+    def cut(self, length: int) -> None:
+        if os.fstat(self.fd).st_size != length:
+            os.ftruncate(self.fd, length)
+            os.fsync(self.fd)
 
-def write_lines(path: Path, entries: Sequence[dict[str, Any]], *, append: bool) -> None:
-    with path.open("a" if append else "w", encoding="utf-8") as handle:
-        for entry in entries:
-            handle.write(json.dumps(entry, ensure_ascii=True) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    def append(self, entry: Mapping[str, Any]) -> None:
+        os.write(self.fd, (json.dumps(entry, ensure_ascii=True) + "\n").encode("ascii"))
+        os.fsync(self.fd)
 
 
 def write_output(path: Path, text: str) -> None:
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_bytes(text.encode("utf-8"))
-    os.replace(temporary, path)
+    """Replace OUT atomically through a new, exclusively created temporary file in its directory."""
+    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(text.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(name, 0o644)
+        os.replace(name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(name)
+        raise
 
 
 # ---------------------------------------------------------------- the loop
 
 def run_learning(args: argparse.Namespace, environment: Mapping[str, str], send: Send) -> int:
-    """Run the command; raises ``Refused`` or ``WriterFailed``."""
+    """Run the command; raises ``Refused`` or ``WriterFailed``. Every refusal happens before anything is written."""
     provider, failures = load_failures(args.run_dir)
     try:
         file_bytes = args.instructions.read_bytes()
@@ -288,59 +353,90 @@ def run_learning(args: argparse.Namespace, environment: Mapping[str, str], send:
         raise Refused(f"cannot read the instruction file {args.instructions}: {error.strerror}") from None
     except ValueError as error:
         raise Refused(str(error)) from None
-    if args.output.resolve() in (args.instructions.resolve(), args.log.resolve()) or args.log.resolve() == args.instructions.resolve():
+    paths = [p.resolve() for p in (args.instructions, args.output, args.log)]
+    if len(set(paths)) != 3:
         raise Refused("--output, --log and --instructions must be three different files")
     key_name = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}[args.writer_provider]
     api_key = environment.get(key_name)
     if not api_key:
         raise Refused(f"{key_name} is not set")
     secrets = [value for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY") if (value := environment.get(name))]
-    identity = identity_of(args, file_bytes, args.run_dir)
+    if any(secret in original for secret in secrets):
+        raise Refused(f"{args.instructions} contains an API key; it would be copied and sent to the writer")
+    identity = identity_of(args, file_bytes, args.run_dir, provider, failures)
     batches = [failures[start:start + args.batch_size] for start in range(0, len(failures), args.batch_size)]
 
-    # An existing output or log must belong to this exact run; its finished batches are replayed, not sent again.
-    text, logged = original, []
-    if args.output.exists() or args.log.exists():
-        if not (args.output.is_file() and args.log.is_file()):
-            raise Refused("an output or log already exists without the other; use new files")
-        logged, _ = read_log(args.log)
-        write_lines(args.log, logged, append=False)  # drops a last line cut short by an interruption
-        for number, entry in enumerate(logged):
-            if entry.get("inputs") != identity:
-                raise Refused(f"{args.log} was written with other inputs or options; use new files")
-            if entry.get("batch") != number or number >= len(batches) or \
-                    entry.get("case_sha256") != [sha256(c.case_id) for c, _, _ in batches[number]]:
-                raise Refused(f"{args.log} does not match the batches of this run; use new files")
-            for rule in entry.get("rules", []):
-                if rule.get("kept"):
-                    text = append_rule(text, rule["text"])
-        if not logged and args.output.read_bytes() != file_bytes:
-            raise Refused(f"{args.output} exists and is not a copy of {args.instructions}; use new files")
-        current = args.output.read_bytes()
-        if not text.encode("utf-8").startswith(current):
-            raise Refused(f"{args.output} does not hold the rules the log says were kept; use new files")
-        if current != text.encode("utf-8"):  # the interruption came between the log and the output
-            write_output(args.output, text)
-    else:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.log.parent.mkdir(parents=True, exist_ok=True)
-        write_output(args.output, original)
-        write_lines(args.log, [], append=False)
+    if args.output.exists() and not args.output.is_file() or args.log.exists() and not args.log.is_file():
+        raise Refused("--output and --log must be regular files")
+    if args.output.exists() and not args.log.exists():
+        raise Refused(f"{args.output} exists without a log; use new files")
+    if not args.log.exists():
+        for parent in {args.output.parent, args.log.parent}:
+            parent.mkdir(parents=True, exist_ok=True)
+    log = Log(args.log, create=not args.log.exists())
+    try:
+        return run_locked(args, log, send, provider, batches, identity, file_bytes, original, api_key, secrets)
+    finally:
+        log.close()
+
+
+def run_locked(args: argparse.Namespace, log: Log, send: Send, provider: str,
+               batches: list[list[tuple[Case, dict[str, Any], str]]], identity: dict[str, Any],
+               file_bytes: bytes, original: str, api_key: str, secrets: Sequence[str]) -> int:
+    header, logged, finished, length = log.read()
+    # The log must belong to this exact run, and the output must be one of the two versions it can have after
+    # an interruption: all logged batches applied, or all but the last.
+    if header is not None and header != identity:
+        raise Refused(f"{args.log} was written with other inputs or options; use new files")
+    versions = [original]
+    for number, entry in enumerate(logged):
+        if entry.get("batch") != number or number >= len(batches) or \
+                entry.get("case_sha256") != [sha256(c.case_id) for c, _, _ in batches[number]]:
+            raise Refused(f"{args.log} does not match the batches of this run; use new files")
+        text = versions[-1]
+        for rule in entry["rules"]:
+            if isinstance(rule, dict) and rule.get("kept"):
+                if not isinstance(rule.get("text"), str):
+                    raise Refused(f"{args.log} holds a kept rule without its text; use new files")
+                text = append_rule(text, rule["text"])
+        versions.append(text)
+    text = versions[-1]
+    current = None
+    if args.output.exists():
+        try:
+            current = args.output.read_bytes().decode("utf-8")
+        except (OSError, ValueError):
+            raise Refused(f"{args.output} cannot be read as text; use new files") from None
+    allowed = [versions[-1]] if finished else versions[-2:]
+    if current is not None and current not in allowed:
+        raise Refused(f"{args.output} is not what the log says it should hold; use new files")
+    if current is None and logged:
+        raise Refused(f"{args.output} is missing but the log holds finished batches; use new files")
+
+    log.cut(length)  # first write: drops a last line cut short by an interruption
+    if header is None:
+        log.append({"header": identity})  # before the first request, so the inputs are on record from the start
+    if current != text:
+        write_output(args.output, text)
+    if finished:
+        return EXIT_DONE
 
     retrying = with_retries(send)
+    run_values = set()
     for number in range(len(logged), len(batches)):
-        entry, text = learn_batch(number, batches[number], text, provider, args, api_key, secrets, retrying, identity)
-        write_lines(args.log, [entry], append=True)  # the log first: a rule in the output is always in the log
+        if not run_values:
+            run_values = expected_strings([case for batch in batches for case, _, _ in batch])
+        entry, text = learn_batch(number, batches[number], text, provider, args, api_key, secrets, retrying, run_values)
+        log.append(entry)  # the log first: a rule in the output is always in the log
         write_output(args.output, text)
         logged.append(entry)
-
-    write_lines_final(args, logged, file_bytes, text)
+    log.append(totals_entry(logged, file_bytes, text))
     return EXIT_DONE
 
 
 def learn_batch(number: int, batch: Sequence[tuple[Case, dict[str, Any], str]], text: str, provider: str,
                 args: argparse.Namespace, api_key: str, secrets: Sequence[str], send: Send,
-                identity: dict[str, Any]) -> tuple[dict[str, Any], str]:
+                run_values: set[str]) -> tuple[dict[str, Any], str]:
     cases = [case for case, _, _ in batch]
     run_model = ""  # the functions are sent as the run sent them; the model name is not part of them
     blocks = [case_block(case, record, provider, run_model, failure) for case, record, failure in batch]
@@ -350,12 +446,13 @@ def learn_batch(number: int, batch: Sequence[tuple[Case, dict[str, Any], str]], 
         reply_text, reported, input_tokens, output_tokens = read_writer_reply(args.writer_provider, reply)
     except Exception as error:  # a failed request stops the command, whatever the library raised
         raise WriterFailed(f"{type(error).__name__}: {redact(str(error), secrets)}"[:500]) from None
+    reported_provider = reply.get("provider") if isinstance(reply.get("provider"), str) else None
     returned = parse_rules(reply_text)
-    expected = expected_strings(cases)  # first read of the expected answers, after the writer has replied
+    batch_values = expected_strings(cases)  # first read of the expected answers, after the writer has replied
     rules = []
-    for index, rule in enumerate(returned or []):
-        reason, _ = judge_rule(rule, text, index, max_bytes=args.max_bytes, lines_per_batch=args.lines_per_batch,
-                               expected=expected, secrets=secrets)
+    for rule in returned or []:
+        reason = judge_rule(rule, text, max_bytes=args.max_bytes, batch_values=batch_values, run_values=run_values,
+                            secrets=secrets)
         shown = rule if isinstance(rule, str) else canonical(rule)
         if reason in SECRET_REASONS:
             rules.append({"sha256": sha256(shown), "length": len(shown), "kept": False, "refused": reason})
@@ -366,21 +463,21 @@ def learn_batch(number: int, batch: Sequence[tuple[Case, dict[str, Any], str]], 
     entry = {
         "batch": number,
         "case_sha256": [sha256(case.case_id) for case in cases],
-        "writer": {"provider": args.writer_provider, "model_requested": args.writer_model, "model_reported": reported},
+        "writer": {"provider_requested": args.writer_provider, "provider_reported": reported_provider,  # null: not reported
+                   "model_requested": args.writer_model, "model_reported": reported},
         "request_sha256": sha256(canonical(request)),
         "reply_was_a_json_array": returned is not None,
         "rules": rules,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
-        "inputs": identity,
     }
     return redact(entry, secrets), text
 
 
-def write_lines_final(args: argparse.Namespace, entries: Sequence[dict[str, Any]], file_bytes: bytes, text: str) -> None:
+def totals_entry(entries: Sequence[dict[str, Any]], file_bytes: bytes, text: str) -> dict[str, Any]:
     rules = [rule for entry in entries for rule in entry["rules"]]
     output = text.encode("utf-8")
-    totals = {"totals": {
+    return {"totals": {
         "batches": len(entries),
         "rules_returned": len(rules),
         "kept": sum(1 for rule in rules if rule["kept"]),
@@ -390,7 +487,6 @@ def write_lines_final(args: argparse.Namespace, entries: Sequence[dict[str, Any]
         "instructions": {"sha256": sha256(file_bytes), "bytes": len(file_bytes)},
         "output": {"sha256": sha256(output), "bytes": len(output)},
     }}
-    write_lines(args.log, [e for e in entries] + [totals], append=False)
 
 
 def build_parser() -> argparse.ArgumentParser:
