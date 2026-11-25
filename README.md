@@ -150,6 +150,72 @@ and `--anthropic-instructions` give one provider its own file;
 * The instruction is text you wrote; no expected answer reaches a model input,
   with or without it.
 
+## Learning instruction lines
+
+One command reads the failed cases of a development run and appends short general rules, written by a model (the
+writer), to a copy of an instruction file:
+
+```sh
+uv run --locked python -m benchmark_loop_agent.learn --run-dir runs/dev --instructions start.txt --output learned.txt \
+    --writer-provider anthropic --writer-model <model id>
+```
+
+| Option | Meaning |
+|--------|---------|
+| `--run-dir DIR`, `--instructions FILE`, `--output OUT` (required) | the development run, the file to start from, and the learned file |
+| `--writer-provider openai\|anthropic`, `--writer-model ID` (required) | the writer; its key is read from `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` at run time and written nowhere |
+| `--max-bytes N` | largest size of `OUT` (default 4,000; the runner's own limit of 8,000 always applies) |
+| `--batch-size N` | failed cases per request (default 20) |
+| `--lines-per-batch N` | most rules asked for per request (default 3) |
+| `--log FILE` | default: `OUT` with `.log.jsonl` appended |
+
+Exit codes: 0 done, 2 refused (before any request), 3 a writer request failed (after the runner's usual retries);
+`OUT` and the log then stay as they were after the last finished batch.
+
+**What the writer is sent.** For each failed record, in batches in case-identifier order: the case's messages, its
+functions as the runner sent them to the provider, the calls the model returned, its `reply_text` (the field is left
+out for a record of an older run that has none) and the failure class of `benchmark_loop_agent.failures`. Before the
+cases of each batch it gets the text of `OUT` as it stands, with the rules kept from earlier batches, and the fixed
+request in [`benchmark_loop_agent/learn_request.txt`](benchmark_loop_agent/learn_request.txt): at most
+`--lines-per-batch` new rules, each one line of at most 300 characters, each a general rule about how to answer, none
+naming a value, a function or a case. The reply is a JSON array of strings.
+
+**What it is never sent.** The expected answer of any case, the checker's reasons (they quote expected values), a
+case identifier, the category name of a case, and anything from the validation or held-out parts. The request is built
+from the records and the question files without reading the answer files. The case's own messages and the calls the
+model returned are sent as they are, even where they equal an expected value. A test gives the answer files of its
+cases unique marker strings and fails if any request holds one.
+
+**What is kept.** `OUT` starts as an exact copy of `FILE`; each rule is appended as its own line, as written, unless
+it is refused (reasons in the log): `not-single-line` (any line break, also a trailing or Unicode one), `invalid-text`, `too-long` (over 300 characters), `duplicate`
+(already in the file), `over-max-bytes`, `over-runner-limit` (past 8,000 bytes),
+`expected-value` (it contains, as written, an expected string value of four characters or more from a case of its
+batch; checked by code that reads the answers after the writer has replied; a rule that quotes an expected value of any
+failed case of the run is refused the same way, because the log must never hold such a text) and `contains-key`.
+The number of rules asked for is a request, not a ground for refusal. Nothing already in
+the file is changed or removed.
+
+**The log** starts with a header line holding the inputs and options of the run (digests of the run files, `FILE`,
+the question and answer content of the failed cases, the writer and the limits), written before the first request.
+It has one JSON line per batch (SHA-256 of each case identifier, the writer's provider and model as requested and as reported (`null` when the reply does not report one),
+SHA-256 of the request, every rule with whether it was kept and why not, tokens) and a final line of totals (batches, rules returned, kept and refused by reason, tokens, SHA-256 and
+byte length of `FILE` and `OUT`). A rule refused for an expected value or a key, and any rule, kept or not, that holds an expected value (two
+characters or more) of a failed case of the run, is logged as its SHA-256 and length only (`text_withheld`); a resumed
+run then takes a withheld kept rule from the line of `OUT` with that digest, and refuses when `OUT` lacks it. The log
+holds no expected value and no key. A model ID that contains a configured key is refused, and so is an existing log
+that this run cannot establish as its own: one that does not start with a complete first line, ending in a newline, that is exactly the header this command writes for these inputs and options (an empty file, a log without `OUT`, and an `OUT` without a log are refused too; no file is matched by a prefix; it is never truncated, and an `OUT` that is not one of the versions the log allows is never replaced). It is only appended to; the one thing ever cut is a last line left unfinished by an interruption. It is locked while a run uses it.
+
+**Refusals (exit code 2, before any request).** A run that is not `--split development`; a run of several providers
+or of none; any record, passing or not, whose case is not in the development part of `data/split.json`; a failed
+record whose failure class cannot be found; an unreadable, empty, over-8,000-byte or non-UTF-8 `FILE`; a missing
+key, or a key inside `FILE`; an unreadable `run.json`; an `OUT` or log that already exists but was made with other inputs or
+options (run, `FILE`, question and answer content, writer, limits), an `OUT` that is neither the complete output of
+the logged batches nor the version before the last one, or a log in use by another run. All of this is checked before
+anything is written.
+
+**Running it again** with the same inputs and options sends no batch that is already in the log and continues after
+it. Learning needs the answer files for the failure classes, like the report does.
+
 ## Output directory
 
 * `records.jsonl`: one JSON Lines record per case and provider, appended as
@@ -439,3 +505,14 @@ env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u PHOENIX_API_KEY -u PHOENIX_COLLECT
 ## Licence
 
 Apache 2.0, see `LICENSE`. BFCL material is Apache 2.0 too; see `NOTICE`.
+
+**Known limits (follow-ups, not handled by this command).**
+
+- *Lengths checked.* The `expected-value` check covers expected string values of four characters or more. Withholding a
+  rule's text from the log covers values of two characters or more. A one-character expected value, or a value of two or
+  three characters for the refusal, is outside the check.
+- *Interrupted between the log and the output.* If a run is interrupted after a batch is written to the log and before
+  `OUT` is replaced, and the log withholds a kept rule's text, a rerun refuses with exit code 2 and sends nothing. This
+  state needs new output and log files.
+- *Interrupted before the first line is complete.* If an interruption leaves the log's first line incomplete, a rerun
+  refuses with exit code 2, sends nothing and leaves both files untouched. This state also needs new output and log files.

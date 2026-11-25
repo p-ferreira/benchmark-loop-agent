@@ -1,0 +1,10 @@
+You are helping to improve a short instruction file that is given to a model before it answers requests that may need function calls. Below are the current text of the instruction file and a batch of cases the model got wrong while using it. Each case shows the messages the model was given, the functions it could call (as they were sent to it), the calls it returned, the text it wrote (when that is known), and a failure class. You are not shown the correct answers.
+
+Write at most {lines_per_batch} new rules to add to the end of the instruction file. Each rule must be:
+- one line, with no line break, of at most {max_characters} characters;
+- a general rule about how to answer, one that would help on many requests;
+- free of any value taken from a case, of any function name or parameter name, and of any reference to a particular case.
+
+Do not repeat a rule that is already in the instruction file, and do not rewrite one. If no general rule follows from these cases, return fewer rules, or none.
+
+Reply with only a JSON array of strings, one string per rule, and nothing else. For no rules, reply with [].
