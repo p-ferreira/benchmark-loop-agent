@@ -330,8 +330,11 @@ and the reason. Cases that could not be scored are the ones with error status.
 ## Report
 
 One Markdown file per model, built only from the run directory
-(`records.jsonl`, `run.json`) and the rates file, never from Phoenix, so it can
-be regenerated at any time:
+(`records.jsonl`, `run.json`), the rates file and the pinned expected answers
+under `data/answers` (the failure classes need the expected number of calls),
+never from Phoenix, so it can be regenerated at any time. Anyone archiving a
+run for later reports must keep that data revision too; a report is refused,
+not written with gaps, when a failed case's expected answer cannot be found:
 
 ```sh
 uv run --locked python -m benchmark_loop_agent.report runs/full [--output-dir DIR] [--rates FILE]
@@ -392,10 +395,10 @@ directory unless `--output-dir` says otherwise. A report holds:
 ### Comparing two runs
 
 ```sh
-uv run --locked python -m benchmark_loop_agent.report --compare DIR_A DIR_B --output-dir DIR
+uv run --locked python -m benchmark_loop_agent.report --compare DIR_A DIR_B [--output-dir DIR]
 ```
 
-Writes `compare-<provider>.md` for each provider both directories hold, never
+Writes `compare-<provider>.md` (to `--output-dir`, by default the current directory) for each provider both directories hold, never
 pairing a case across providers; it is refused when they share no provider.
 It compares the cases both runs selected (a full run can be compared with a run
 of one `--split` part), states how many cases only A and only B selected, and is

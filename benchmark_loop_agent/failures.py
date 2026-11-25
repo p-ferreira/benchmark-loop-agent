@@ -35,7 +35,9 @@ def _malformed(category: str, record: dict[str, Any]) -> bool:
     # live_relevance only says "no call", so its malformed calls are found in the record:
     # an entry whose arguments are not an object (a decoded deep object alone would have passed).
     if category == "live_relevance":
-        return any(not isinstance(arguments, dict) for call in record.get("returned_calls") or []
+        # A non-finite number (1e400) is saved as {"unrepresentable_number": ...} (json_safe), which hides its type.
+        return any(not isinstance(arguments, dict) or set(arguments) == {"unrepresentable_number"}
+                   for call in record.get("returned_calls") or []
                    if isinstance(call, dict) for arguments in call.values())
     return False
 

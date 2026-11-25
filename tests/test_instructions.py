@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,7 +16,8 @@ from benchmark_loop_agent.categories import CATEGORIES
 from benchmark_loop_agent.compare import Run, compare_runs
 from benchmark_loop_agent.dataset import load_cases, load_expected_answers
 from benchmark_loop_agent.failures import failure_class
-from benchmark_loop_agent.instructions import digest
+from benchmark_loop_agent.instructions import digest, read_instruction
+from benchmark_loop_agent.record import json_safe
 from benchmark_loop_agent.providers import anthropic_request, openai_request
 from benchmark_loop_agent.runner import run_provider
 from benchmark_loop_agent.store import read_manifest, read_records
@@ -123,6 +125,11 @@ class FailureClassTests(unittest.TestCase):
         self.assertEqual(failure_class(self.record(one, [call, call])), "too-many-calls")
         self.assertEqual(failure_class(self.record(one, [call])), "wrong-call")
         self.assertEqual(failure_class(self.record(many, [call, call])), "wrong-call")
+
+    def test_a_non_finite_live_relevance_argument_is_malformed(self) -> None:
+        case = case_by_id("live_relevance")
+        saved = json_safe({"f": float("inf")})
+        self.assertEqual(failure_class(self.record(case, [saved], ["Invalid syntax. Failed to decode AST when it should have."])), "malformed-call")
 
     def test_live_relevance_failures_are_malformed_or_no_call(self) -> None:
         case = case_by_id("live_relevance")
@@ -334,8 +341,32 @@ class CompareTests(unittest.TestCase):
             self.assertIn(digest(TEXT)["sha256"], text)
             self.assertIn("| B |", text)
             self.assertIn("`m`", text)
-            code, _ = silent_report(["--compare", str(a), str(b)])
+            # without --output-dir the comparison goes to the current directory
+            cwd, elsewhere = os.getcwd(), Path(tmp, "here")
+            elsewhere.mkdir()
+            os.chdir(elsewhere)
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(report.main(["--compare", str(a), str(b)]), 0)
+            finally:
+                os.chdir(cwd)
+            self.assertEqual([p.name for p in elsewhere.iterdir()], [path.name])
+
+    def test_a_report_stops_when_a_failed_case_cannot_be_classified(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            run_batch(out, params(providers=("openai",)), environment("openai"), FakeSend(lambda p, r: openai_reply([{"f": {}}])), sleep=lambda s: None)
+            with mock.patch("benchmark_loop_agent.failures.load_expected_answers", side_effect=OSError("gone")):
+                code, err = silent_report([str(out), "--output-dir", str(out / "o")])
             self.assertEqual(code, 2)
+            self.assertIn("failure class is unknown", err)
+
+    def test_an_oversized_instruction_is_refused_after_a_bounded_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "big.txt")
+            path.write_bytes(b"a" * 100_000)
+            with self.assertRaisesRegex(ValueError, "8000"):
+                read_instruction(path)
 
 
 def silent_report(argv):

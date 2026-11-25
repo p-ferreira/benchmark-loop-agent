@@ -7,7 +7,7 @@ expected number of calls of a failed case, and which cases a run selected.
 
     python -m benchmark_loop_agent.report RUN_DIR [--rates FILE] [--output-dir DIR]
     python -m benchmark_loop_agent.report RUN_DIR RUN_DIR ... --output-dir DIR   # spread over repeated runs
-    python -m benchmark_loop_agent.report --compare DIR_A DIR_B --output-dir DIR   # two runs, case by case
+    python -m benchmark_loop_agent.report --compare DIR_A DIR_B [--output-dir DIR]   # two runs, case by case
 """
 
 import argparse
@@ -86,12 +86,11 @@ def comparison_section(manifest: dict[str, Any], provider: str, records: list[di
 def failure_section(provider: str, records: list[dict[str, Any]], categories: Sequence[str]) -> list[str]:
     """Failed cases by class, per category and overall; each failed case has exactly one class."""
     mine = [r for r in records if r["provider"] == provider and r["outcome"] == "fail"]
-    classes: list[tuple[str, str | None]] = []
-    for r in mine:
-        try:
-            classes.append((r["category"], failure_class(r)))
-        except UnknownCase:
-            classes.append((r["category"], None))  # a record for a case the dataset does not hold
+    try:
+        classes = [(r["category"], failure_class(r)) for r in mine]
+    except UnknownCase as error:
+        raise ValueError(f"the expected answer of {error} cannot be found in the pinned data, so its failure "
+                         "class is unknown; the report is not written") from None
     out = ["## Failure classes", "",
            "Each failed case has exactly one class, the first of these that applies: "
            "`called-when-none-applied` (a failure in `irrelevance` or `live_irrelevance`); `malformed-call` (a "
@@ -107,10 +106,6 @@ def failure_section(provider: str, records: list[dict[str, Any]], categories: Se
         cells = " | ".join(str(counts[c]) for c in FAILURE_CLASSES)
         label, bold = ("Overall", "**") if key is None else (f"`{key}`", "")
         out.append(f"| {bold}{label}{bold} | {len(subset)} | {cells} |")
-    unknown = sum(1 for _, c in classes if c is None)
-    if unknown:
-        out += ["", f"{unknown} failed case(s) are not in the dataset, so their class cannot be given; they are in "
-                    "the Failed column only."]
     return out + [""]
 
 
@@ -280,17 +275,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--rates", type=Path, default=RATES_FILE, help="rates file (default: data/rates.json)")
     parser.add_argument("--output-dir", type=Path, default=None, help="where the reports go (default: the run directory)")
     parser.add_argument("--compare", type=Path, nargs=2, default=None, metavar=("DIR_A", "DIR_B"),
-                        help="compare two run directories case by case, one file per provider both hold; needs --output-dir")
+                        help="compare two run directories case by case, one file per provider both hold (default destination: the current directory)")
     args = parser.parse_args(argv)
     if args.compare and args.run_dirs:
         parser.error("--compare takes its two run directories itself; give no RUN_DIR")
-    if args.compare and args.output_dir is None:
-        parser.error("--output-dir is required with --compare")
     if not args.compare and not args.run_dirs:
         parser.error("give a RUN_DIR, or --compare DIR_A DIR_B")
     try:
         if args.compare:
-            paths = build_comparison(*args.compare, args.output_dir)
+            paths = build_comparison(*args.compare, args.output_dir or Path.cwd())
         elif len(args.run_dirs) == 1:
             paths = build_reports(args.run_dirs[0], args.rates, args.output_dir or args.run_dirs[0])
         elif args.output_dir is None:
