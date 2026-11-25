@@ -280,11 +280,11 @@ class Log:
     def close(self) -> None:
         os.close(self.fd)
 
-    def read(self, header_line: bytes) -> tuple[dict[str, Any] | None, list[dict[str, Any]], bool, int]:
+    def read(self, header_line: bytes, *, fresh: bool) -> tuple[dict[str, Any] | None, list[dict[str, Any]], bool, int]:
         """(header, batch entries, finished by totals, length of the complete lines). Anything unreadable is refused.
 
-        ``header_line`` is the header this run would write: a file with no complete line is accepted only if it is
-        empty or an unfinished start of exactly that line.
+        ``header_line`` is the header this run would write. A log this run just created (``fresh``) must be empty.
+        Any other log is accepted only if its first line is complete, ends with a newline and is exactly that line.
         """
         size = os.fstat(self.fd).st_size
         data = b""
@@ -295,8 +295,12 @@ class Log:
             data += chunk
         complete = data[:data.rfind(b"\n") + 1]  # a last line without its newline was cut short
         tail = data[len(complete):]
-        if not complete and not header_line.startswith(tail):
-            raise Refused(f"the log {self.path} is not a log of this command")
+        if fresh:
+            if data:
+                raise Refused(f"{self.path} was created by another run; use new files")
+            return None, [], False, 0
+        if not data.startswith(header_line):
+            raise Refused(f"the log {self.path} is not a log of this command for these inputs and options; use new files")
         if tail and not any(tail.startswith(mark) or mark.startswith(tail) for mark in (b'{"header": ', b'{"batch": ', b'{"totals": ')):
             raise Refused(f"the log {self.path} is not a log of this command")
         header, batches, finished = None, [], False
@@ -387,9 +391,12 @@ def run_learning(args: argparse.Namespace, environment: Mapping[str, str], send:
     if not args.log.exists():
         for parent in {args.output.parent, args.log.parent}:
             parent.mkdir(parents=True, exist_ok=True)
-    log = Log(args.log, create=not args.log.exists())
+    fresh = not args.log.exists()
+    if not fresh and not args.output.exists():
+        raise Refused(f"{args.log} exists without {args.output}; use new files")
+    log = Log(args.log, create=fresh)
     try:
-        return run_locked(args, log, send, provider, batches, identity, file_bytes, original, api_key, secrets)
+        return run_locked(args, log, fresh, send, provider, batches, identity, file_bytes, original, api_key, secrets)
     finally:
         log.close()
 
@@ -404,10 +411,11 @@ def kept_text(rule: dict[str, Any], lines: dict[str, str], where: Path) -> str:
     return line
 
 
-def run_locked(args: argparse.Namespace, log: Log, send: Send, provider: str,
+def run_locked(args: argparse.Namespace, log: Log, fresh: bool, send: Send, provider: str,
                batches: list[list[tuple[Case, dict[str, Any], str]]], identity: dict[str, Any],
                file_bytes: bytes, original: str, api_key: str, secrets: Sequence[str]) -> int:
-    header, logged, finished, length = log.read((json.dumps({"header": identity}, ensure_ascii=True) + "\n").encode("ascii"))
+    header, logged, finished, length = log.read((json.dumps({"header": identity}, ensure_ascii=True) + "\n").encode("ascii"),
+                                                fresh=fresh)
     # The log must belong to this exact run, and the output must be one of the two versions it can have after
     # an interruption: all logged batches applied, or all but the last.
     if header is not None and header != identity:
