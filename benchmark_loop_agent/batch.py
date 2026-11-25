@@ -4,11 +4,12 @@ import time
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from .dataset import Case
+from .instructions import digest, instruction_file_name
 from .record import Record
 from .retry import with_retries
 from .runner import PROVIDERS, run_provider
@@ -29,11 +30,16 @@ class RunParameters:
     models: dict[str, str | None]  # requested model ID per provider (no default in code)
     concurrency: int
     split: str | None = None  # a part of the split file; None means every case
+    instructions: dict[str, str] = field(default_factory=dict)  # instruction text per provider; none means no instruction
 
     def identity(self) -> dict[str, Any]:
         """The parameters a resumed run must repeat (concurrency may change; each session records its own)."""
         data = asdict(self)
         del data["concurrency"]
+        del data["instructions"]
+        used = {name: digest(self.instructions[name]) for name in self.providers if name in self.instructions}
+        if used:  # a run without instructions is saved as before, so earlier runs still resume
+            data["instructions"] = used
         if data["split"] is None:  # a run without a part is saved as before, so earlier runs still resume
             del data["split"]
         return data
@@ -67,7 +73,7 @@ def run_batch(
         if saved != _jsonable(parameters.identity()):
             raise ValueError(
                 f"{directory} holds a run with different parameters; use a new --output-dir "
-                "or repeat the original categories, sample size, seed, split part, providers and models"
+                "or repeat the original categories, sample size, seed, split part, providers, models and instruction text"
             )
 
     cases = select_cases(parameters.categories, parameters.sample_size, parameters.seed, parameters.split)
@@ -82,6 +88,9 @@ def run_batch(
     if previous is not None and "selection_fingerprint" not in previous:
         _refuse_stale_records(directory, {case.case_id for case in cases})
     store = RecordStore(directory)
+    for name in parameters.providers:
+        if name in parameters.instructions:
+            (directory / instruction_file_name(name)).write_bytes(parameters.instructions[name].encode("utf-8"))
     finished = store.open_for_resume()
     pending = [(name, case) for case in cases for name in parameters.providers
                if (name, case.case_id) not in finished]
@@ -97,12 +106,12 @@ def run_batch(
     def work(job: tuple[str, Case]) -> Record:
         name, case = job
         if tracing is None:
-            record = run_provider(name, case, environment, retrying)
+            record = run_provider(name, case, environment, retrying, instruction=parameters.instructions.get(name))
         else:
             with tracing.case(provider=name, requested_model=parameters.models.get(name), case_id=case.case_id,
                               category=case.category, invocation=number,
                               question="\n".join(m.get("content", "") for m in case.messages)) as span:
-                record = run_provider(name, case, environment, retrying, span.scored)
+                record = run_provider(name, case, environment, retrying, span.scored, parameters.instructions.get(name))
                 span.outcome(record, case)
         store.append(record)
         return record

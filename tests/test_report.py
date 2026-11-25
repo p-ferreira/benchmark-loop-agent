@@ -21,7 +21,7 @@ def record(provider, case_id, category, outcome, tokens=(100, 10), model="gpt-kn
 
 RECORDS = [
     record("openai", "a1", "simple_python", "pass", (1000, 100)),
-    record("openai", "a2", "simple_python", "fail", (2000, 200)),
+    record("openai", "simple_python_0", "simple_python", "fail", (2000, 200)),
     record("openai", "b1", "irrelevance", "pass", (3000, 300)),
     record("openai", "b2", "irrelevance", "pass", None),  # response without usage
     record("openai", "b3", "irrelevance", "unscored", None),

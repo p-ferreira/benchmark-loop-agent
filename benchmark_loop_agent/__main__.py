@@ -9,6 +9,7 @@ from typing import Sequence
 
 from .batch import RunParameters, run_batch
 from .categories import CATEGORIES
+from .instructions import read_instruction
 from .providers import send_request
 from .record import Record
 from .runner import PROVIDERS
@@ -48,6 +49,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="provider to run; repeat for several (default: all)")
     parser.add_argument("--openai-model", help="OpenAI model ID (default: $OPENAI_MODEL)")
     parser.add_argument("--anthropic-model", help="Anthropic model ID (default: $ANTHROPIC_MODEL)")
+    parser.add_argument("--instructions", type=Path, default=None, metavar="FILE",
+                        help="UTF-8 text file (1 to 8,000 bytes) sent first in every request, for each provider without its own file")
+    parser.add_argument("--openai-instructions", type=Path, default=None, metavar="FILE",
+                        help="instruction file for OpenAI only (developer message); overrides --instructions")
+    parser.add_argument("--anthropic-instructions", type=Path, default=None, metavar="FILE",
+                        help="instruction file for Anthropic only (system field); overrides --instructions")
     parser.add_argument("--concurrency", type=int, default=4, help="requests in flight at once (default: 4)")
     return parser
 
@@ -59,6 +66,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--concurrency must be at least 1")
     if args.sample_size is not None and args.sample_size < 0:
         parser.error("--sample-size must not be negative")
+
+    # Every file is checked before any request, even one for a provider this run leaves out.
+    try:
+        files = {"default": args.instructions, "openai": args.openai_instructions, "anthropic": args.anthropic_instructions}
+        texts = {key: read_instruction(path) for key, path in files.items() if path is not None}
+    except ValueError as error:
+        parser.error(str(error))
 
     environment = dict(os.environ)
     for flag, variable in ((args.openai_model, "OPENAI_MODEL"), (args.anthropic_model, "ANTHROPIC_MODEL")):
@@ -73,6 +87,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         models={n: environment.get(PROVIDERS[n].model_env) or None for n in names},
         concurrency=args.concurrency,
         split=args.split,
+        instructions={n: texts[key] for n in names if (key := n if n in texts else "default") in texts},
     )
     try:
         records = run_batch(args.output_dir, parameters, environment, send_request,

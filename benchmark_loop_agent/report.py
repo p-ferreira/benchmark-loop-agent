@@ -1,11 +1,13 @@
 """One Markdown report per model, built from a finished run's files only.
 
 Reads ``records.jsonl`` and ``run.json`` of the run directory and the rates
-file. It never reads Phoenix, the dataset or the network, so a report can be
-regenerated at any time.
+file. It never reads Phoenix or the network, so a report can be regenerated at
+any time. Only the failure classes and ``--compare`` read the dataset: the
+expected number of calls of a failed case, and which cases a run selected.
 
     python -m benchmark_loop_agent.report RUN_DIR [--rates FILE] [--output-dir DIR]
     python -m benchmark_loop_agent.report RUN_DIR RUN_DIR ... --output-dir DIR   # spread over repeated runs
+    python -m benchmark_loop_agent.report --compare DIR_A DIR_B [--output-dir DIR]   # two runs, case by case
 """
 
 import argparse
@@ -17,7 +19,9 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .comparison import OVERALL, UNAVAILABLE, comparison_counts, format_figure
+from .compare import build_comparison
 from .dataset import DATA_DIR
+from .failures import FAILURE_CLASSES, UnknownCase, failure_class
 from .repeats import render_spread, spreads
 from .store import MANIFEST_FILE, RECORDS_FILE, read_manifest, read_records
 
@@ -77,6 +81,39 @@ def comparison_section(manifest: dict[str, Any], provider: str, records: list[di
         out.append(f"| {bold}{label}{bold} | "
                    f"{bold}{format_figure(passed, selected)}{bold} | {selected} | {passed} | {failed} | {unscored} | {missing} |")
     return out + [""]
+
+
+def failure_section(provider: str, records: list[dict[str, Any]], categories: Sequence[str]) -> list[str]:
+    """Failed cases by class, per category and overall; each failed case has exactly one class."""
+    mine = [r for r in records if r["provider"] == provider and r["outcome"] == "fail"]
+    try:
+        classes = [(r["category"], failure_class(r)) for r in mine]
+    except UnknownCase as error:
+        raise ValueError(f"the expected answer of {error} cannot be found in the pinned data, so its failure "
+                         "class is unknown; the report is not written") from None
+    out = ["## Failure classes", "",
+           "Each failed case has exactly one class, the first of these that applies: "
+           "`called-when-none-applied` (a failure in `irrelevance` or `live_irrelevance`); `malformed-call` (a "
+           "returned call could not be scored: arguments that are not a JSON object, or nested too deep); "
+           "`no-call` (a call was expected and none came back); `too-few-calls` and `too-many-calls` (the number "
+           "of calls differs from the expected answer's); `wrong-call` (the number is right and the checker "
+           "rejected a name, a parameter, a type or a value). Unscored cases are not failures and are not counted here.", "",
+           "| Category | Failed | " + " | ".join(f"`{c}`" for c in FAILURE_CLASSES) + " |",
+           "| --- | --- | " + " | ".join("---" for _ in FAILURE_CLASSES) + " |"]
+    for key in [*categories, None]:
+        subset = [c for category, c in classes if key is None or category == key]
+        counts = Counter(subset)
+        cells = " | ".join(str(counts[c]) for c in FAILURE_CLASSES)
+        label, bold = ("Overall", "**") if key is None else (f"`{key}`", "")
+        out.append(f"| {bold}{label}{bold} | {len(subset)} | {cells} |")
+    return out + [""]
+
+
+def instruction_line(manifest: dict[str, Any], provider: str) -> str:
+    used = (manifest["parameters"].get("instructions") or {}).get(provider)
+    if not used:
+        return "* Instruction: none used"
+    return f"* Instruction: SHA-256 `{used['sha256']}`, {used['bytes']} bytes"
 
 
 def render(manifest: dict[str, Any], provider: str, records: list[dict[str, Any]],
@@ -141,6 +178,7 @@ def render(manifest: dict[str, Any], provider: str, records: list[dict[str, Any]
     out += [f"| **Overall** | **{accuracy(counts['pass'], counts['fail'])}** | {counts['pass']} | {counts['fail']} | {counts['unscored']} |", ""]
 
     out += comparison_section(manifest, provider, records)
+    out += failure_section(provider, records, params["categories"])
 
     # Each known count is summed on its own; a record with only one of them still counts that one.
     in_tokens = sum(r["input_tokens"] for r in mine if r["input_tokens"] is not None)
@@ -183,6 +221,7 @@ def render(manifest: dict[str, Any], provider: str, records: list[dict[str, Any]
             f"* Sample size per category: {f'at most {cap}' if sampled else 'all cases'}",
             f"* Seed: {params['seed']}",
             f"* Split part: {split or 'none, every case of the categories'}",
+            instruction_line(manifest, provider),
             f"* Providers in the run: {', '.join(params['providers'])}", ""]
     return "\n".join(out)
 
@@ -222,7 +261,8 @@ def build_repeated_report(run_dirs: Sequence[Path], output_dir: Path) -> list[Pa
     for provider, rows in table.items():
         model = params["models"].get(provider)
         path = output_dir / file_name(provider, model).replace("report-", "repeated-", 1)
-        path.write_text(render_spread(provider, model, params.get("split"), names, rows))
+        path.write_text(render_spread(provider, model, params.get("split"), names, rows,
+                                      instruction_line(manifests[0], provider)))
         written.append(path)
     return written
 
@@ -230,13 +270,21 @@ def build_repeated_report(run_dirs: Sequence[Path], output_dir: Path) -> list[Pa
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="benchmark_loop_agent.report",
                                      description="Write one Markdown report per model from a run directory.")
-    parser.add_argument("run_dirs", type=Path, nargs="+", metavar="RUN_DIR",
+    parser.add_argument("run_dirs", type=Path, nargs="*", metavar="RUN_DIR",
                         help="the --output-dir of a finished run; several of one configuration give the spread of the comparison figure")
     parser.add_argument("--rates", type=Path, default=RATES_FILE, help="rates file (default: data/rates.json)")
     parser.add_argument("--output-dir", type=Path, default=None, help="where the reports go (default: the run directory)")
+    parser.add_argument("--compare", type=Path, nargs=2, default=None, metavar=("DIR_A", "DIR_B"),
+                        help="compare two run directories case by case, one file per provider both hold (default destination: the current directory)")
     args = parser.parse_args(argv)
+    if args.compare and args.run_dirs:
+        parser.error("--compare takes its two run directories itself; give no RUN_DIR")
+    if not args.compare and not args.run_dirs:
+        parser.error("give a RUN_DIR, or --compare DIR_A DIR_B")
     try:
-        if len(args.run_dirs) == 1:
+        if args.compare:
+            paths = build_comparison(*args.compare, args.output_dir or Path.cwd())
+        elif len(args.run_dirs) == 1:
             paths = build_reports(args.run_dirs[0], args.rates, args.output_dir or args.run_dirs[0])
         elif args.output_dir is None:
             parser.error("--output-dir is required with several run directories")
