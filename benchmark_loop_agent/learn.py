@@ -280,8 +280,12 @@ class Log:
     def close(self) -> None:
         os.close(self.fd)
 
-    def read(self) -> tuple[dict[str, Any] | None, list[dict[str, Any]], bool, int]:
-        """(header, batch entries, finished by totals, length of the complete lines). Anything unreadable is refused."""
+    def read(self, header_line: bytes) -> tuple[dict[str, Any] | None, list[dict[str, Any]], bool, int]:
+        """(header, batch entries, finished by totals, length of the complete lines). Anything unreadable is refused.
+
+        ``header_line`` is the header this run would write: a file with no complete line is accepted only if it is
+        empty or an unfinished start of exactly that line.
+        """
         size = os.fstat(self.fd).st_size
         data = b""
         while len(data) < size:
@@ -291,6 +295,8 @@ class Log:
             data += chunk
         complete = data[:data.rfind(b"\n") + 1]  # a last line without its newline was cut short
         tail = data[len(complete):]
+        if not complete and not header_line.startswith(tail):
+            raise Refused(f"the log {self.path} is not a log of this command")
         if tail and not any(tail.startswith(mark) or mark.startswith(tail) for mark in (b'{"header": ', b'{"batch": ', b'{"totals": ')):
             raise Refused(f"the log {self.path} is not a log of this command")
         header, batches, finished = None, [], False
@@ -401,7 +407,7 @@ def kept_text(rule: dict[str, Any], lines: dict[str, str], where: Path) -> str:
 def run_locked(args: argparse.Namespace, log: Log, send: Send, provider: str,
                batches: list[list[tuple[Case, dict[str, Any], str]]], identity: dict[str, Any],
                file_bytes: bytes, original: str, api_key: str, secrets: Sequence[str]) -> int:
-    header, logged, finished, length = log.read()
+    header, logged, finished, length = log.read((json.dumps({"header": identity}, ensure_ascii=True) + "\n").encode("ascii"))
     # The log must belong to this exact run, and the output must be one of the two versions it can have after
     # an interruption: all logged batches applied, or all but the last.
     if header is not None and header != identity:

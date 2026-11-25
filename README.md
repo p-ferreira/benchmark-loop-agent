@@ -203,7 +203,7 @@ byte length of `FILE` and `OUT`). A rule refused for an expected value or a key,
 characters or more) of a failed case of the run, is logged as its SHA-256 and length only (`text_withheld`); a resumed
 run then takes a withheld kept rule from the line of `OUT` with that digest, and refuses when `OUT` lacks it. The log
 holds no expected value and no key. A model ID that contains a configured key is refused, and so is an existing log
-that is not one of this command's (it is never truncated). It is only appended to; the one thing ever cut is a last line left unfinished by an interruption. It is locked while a run uses it.
+that this run cannot establish as its own: one whose complete lines are not this command's, or a file with no complete line that is not empty or an unfinished start of the exact header this run would write (it is never truncated, and an `OUT` that is not one of the versions the log allows is never replaced). It is only appended to; the one thing ever cut is a last line left unfinished by an interruption. It is locked while a run uses it.
 
 **Refusals (exit code 2, before any request).** A run that is not `--split development`; a run of several providers
 or of none; any record, passing or not, whose case is not in the development part of `data/split.json`; a failed
@@ -505,3 +505,12 @@ env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u PHOENIX_API_KEY -u PHOENIX_COLLECT
 ## Licence
 
 Apache 2.0, see `LICENSE`. BFCL material is Apache 2.0 too; see `NOTICE`.
+
+**Known limits (follow-ups, not handled by this command).**
+
+- *Lengths checked.* The `expected-value` check covers expected string values of four characters or more. Withholding a
+  rule's text from the log covers values of two characters or more. A one-character expected value, or a value of two or
+  three characters for the refusal, is outside the check.
+- *Interrupted between the log and the output.* If a run is interrupted after a batch is written to the log and before
+  `OUT` is replaced, and the log withholds a kept rule's text, a rerun refuses with exit code 2 and sends nothing. This
+  state needs new output and log files.

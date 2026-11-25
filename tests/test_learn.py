@@ -231,6 +231,18 @@ class KeepingTests(LearnTest):
         self.assertEqual((code, len(send.requests)), (2, 0))
         self.assertEqual(log.read_text(), "my notes without a newline")
 
+    def test_a_file_that_only_starts_like_a_header_is_refused_and_left_alone(self) -> None:
+        for content in ('{"header": "personal notes"}', '{"header": {"x": 1}}\n'):
+            with self.subTest(content=content):
+                log = Path(str(self.out) + ".log.jsonl")
+                log.parent.mkdir(parents=True, exist_ok=True)
+                log.write_text(content)
+                code, send, _ = self.run_cli([])
+                self.assertEqual((code, len(send.requests)), (2, 0))
+                self.assertEqual(log.read_text(), content)
+                self.assertFalse(self.out.exists())
+                log.unlink()
+
     def test_a_secret_in_the_writer_model_is_refused_before_the_log_exists(self) -> None:
         code, send, _ = self.run_cli([], argv=self.argv(writer_model=WRITER_KEY))
         self.assertEqual((code, len(send.requests)), (2, 0))
