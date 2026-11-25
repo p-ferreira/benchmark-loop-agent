@@ -577,7 +577,9 @@ orchestrator builder for two tasks and fails on any difference in the system pro
 that the request carries them. Calls: OpenAI Responses API (`instructions`, function tools, `store: false`), Anthropic
 Messages (`max_tokens` 8192). No temperature is sent. If the Messages API refuses a conversation that starts with
 upstream's assistant greeting ("first message must use the user role"), the same request is sent once more with a
-one-character user turn before it.
+one-character user turn (".") before it. That is the translation litellm's Anthropic adapter makes when `modify_params`
+is on (it is off by default, so upstream's own agent would fail on Anthropic here); the record says when it happened
+(`agent_opening_user_turn_added`).
 
 **Caching.** Anthropic: `cache_control` on the system block, on the last tool and on the last block of the last
 message (so each call reads the previous call's prefix). OpenAI: caching is automatic for the stable prefix; every
@@ -596,12 +598,12 @@ the provider reports them: Anthropic's `input_tokens` (uncached), `cache_creatio
 | `outcome` | `pass` (upstream's reward is 1), `fail` (a scored conversation with another reward, including one that reached upstream's step limit: reward 0) or `unscored` |
 | `reward`, `reward_components` | upstream's reward (`null` when unscored), and what its evaluator reports: `reward_breakdown`, `reward_basis`, `db_check`, `action_checks`, `env_assertions`, `communicate_checks`, `nl_assertions` and `info` |
 | `termination_reason`, `reason` | upstream's termination reason; for `unscored`, why |
-| `agent_calls`, `agent_models`, `agent_tokens` | the agent's model calls, the model names the provider reported, and the tokens `uncached_input`, `cache_write_input`, `cache_read_input`, `output` |
-| `customer_usage`, `judges_usage` | per model: `calls`, `prompt_tokens`, `cached_tokens`, `completion_tokens`, `reasoning_tokens` (as upstream's litellm replies report them) and the reported model names; a judge that was not needed (a task without natural-language assertions or required information) is simply absent |
+| `agent_calls`, `agent_calls_without_usage`, `agent_models`, `agent_tokens` | the requests the agent dispatched (each transport retry and each request the API rejected counts), how many of them have no reported usage (their tokens are unknown, not zero), the model names the provider reported, and the tokens `uncached_input`, `cache_write_input`, `cache_read_input`, `output` |
+| `customer_usage`, `judges_usage` | per model: `calls`, `prompt_tokens`, `cached_tokens`, `completion_tokens`, `cache_creation_tokens`, `reasoning_tokens`, `calls_without_usage` (as upstream's litellm replies report them) and the reported model names; a judge that was not needed (a task without natural-language assertions or required information) is simply absent |
 | `elapsed_seconds` | wall time of the attempt |
 | `earlier_unscored_attempts` | the same fields of each earlier attempt of this task and trial that ended `unscored` |
 
-**Unscored.** A conversation that ended in a provider error (of the agent, the customer or a judge), a refusal, or one of
+**Unscored.** A conversation that ended in a provider error (of the agent, the customer or a judge), a refusal (the agent's, or an explicit refusal signal in a customer or judge reply: a `refusal` field or a `content_filter` finish; the call's usage is kept), or one of
 upstream's own terminations by error (`agent_error`, `user_error`, `too_many_errors`, `infrastructure_error`,
 `context_window_exceeded`, `timeout`, `unexpected_error`) is `unscored` with its reason, never a pass or a fail. Only
 `agent_stop`, `user_stop` and `max_steps` are scored. `conversations.jsonl` keeps the full conversation of every attempt
@@ -609,8 +611,9 @@ upstream's own terminations by error (`agent_error`, `user_error`, `too_many_err
 had seen by then and is marked `partial`.
 
 **Running again** with the same `DIR` and options runs only the conversations that are missing or `unscored`; a scored one
-is never repeated. Different options (provider, models, tasks, trials, seed, instruction text) over an existing `DIR` are
-refused; the concurrency may change. When a rerun scores, the record holds the usage of the attempt that gave the result, and
+is never repeated; the full record is committed in the same line of `conversations.jsonl` that holds the conversation, so a
+stop between that line and the rewrite of `records.jsonl` is recovered at the next start. Different options (provider, models, tasks, trials, concurrency, seed, instruction text) over an existing `DIR` are
+refused. An instruction text that contains a configured key is refused too. When a rerun scores, the record holds the usage of the attempt that gave the result, and
 `earlier_unscored_attempts` the usage of each earlier unscored attempt.
 
 ### Report
@@ -620,13 +623,14 @@ trials, scored and unscored conversations; the pass rate over scored conversatio
 tasks passed in all `k` trials for each `k` up to the trial count (upstream's `pass^k`, the mean over tasks of
 `C(c, k) / C(n, k)`), over the tasks whose every trial is scored, with the tasks left out for an unscored or missing trial
 counted and named; the unscored conversations and their reasons; token totals by kind for the agent, the customer and the
-judges; the cost per scored conversation (from the attempts that gave the results); and the total spent, which adds the
+judges, for the attempts that gave the results and, apart, for unscored and earlier unscored attempts (also without rates); the cost per scored conversation (from the attempts that gave the results); and the total spent, which adds the
 unscored attempts, shown apart.
 
 **Rates.** `data/rates.json` is unchanged and no rate is written by bla. `--rates FILE` takes a file of the same form, in which
 a model may also have `cache_read` and `cache_write` rates (US dollars per 1 million tokens). A model with no rate, or tokens
 of a kind for which its model has no rate, are reported as *not priced*, never as zero and never at another kind's rate;
-a figure that includes one is *not priced*. A component that used no tokens at all shows *none*.
+a figure that includes one is *not priced*. A component that used no tokens at all shows *none*; a figure over calls whose reply carried no usage says *at least* and
+how many calls are unknown.
 
 The retail tests (`tests/test_tau.py`) use scripted stand-ins for the agent's provider, the customer and the judges, and a
 fixture of made-up rates; they need no key and no connection.

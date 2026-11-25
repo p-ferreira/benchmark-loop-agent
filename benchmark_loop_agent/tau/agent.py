@@ -9,6 +9,7 @@ prompt caching and counts the tokens each reply reports, by kind.
 import contextvars
 import hashlib
 import json
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -37,6 +38,7 @@ class AgentCall:
     output_tokens: int
     stop_reason: str | None = None
     latency_seconds: float = 0.0
+    usage_reported: bool = True  # False: the reply carried no usage, so the zeros above are unknown, not measured
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -49,11 +51,17 @@ TOKEN_KINDS = ("uncached_input_tokens", "cache_write_input_tokens", "cache_read_
 class AgentUsage:
     """Every call the agent made in one attempt, kept even when the attempt fails."""
 
-    calls: list[AgentCall] = field(default_factory=list)
+    calls: list[AgentCall] = field(default_factory=list)  # replies that arrived and could be read for usage
+    dispatches: int = 0  # requests actually sent: transport retries and requests the API rejected count, replies or not
+    opening_turn_added: bool = False  # the Anthropic retry that prepends a user turn happened
     messages: list[Any] = field(default_factory=list)  # the agent's view of the conversation so far, for a failed attempt
 
     def totals(self) -> dict[str, int]:
         return {kind: sum(getattr(call, kind) for call in self.calls) for kind in TOKEN_KINDS}
+
+    def calls_without_usage(self) -> int:
+        """Requests whose tokens are unknown: sent, but no reply with usage came back."""
+        return self.dispatches - sum(1 for call in self.calls if call.usage_reported)
 
     def models(self) -> list[str]:
         return list(dict.fromkeys(call.model for call in self.calls if call.model))
@@ -178,7 +186,7 @@ def parse_openai(reply: dict[str, Any]) -> tuple[str, list[dict[str, Any]], Agen
         usage = reply.get("usage") or {}
         cached = _int((usage.get("input_tokens_details") or {}).get("cached_tokens"))
         call = AgentCall(reply.get("model"), max(_int(usage.get("input_tokens")) - cached, 0), 0, cached,
-                         _int(usage.get("output_tokens")), reply.get("status"))
+                         _int(usage.get("output_tokens")), reply.get("status"), usage_reported=bool(usage))
         return "".join(texts), calls, call
     except (KeyError, TypeError, AttributeError) as error:
         raise AgentCallError(f"unexpected OpenAI response shape: {type(error).__name__}: {error}") from None
@@ -189,7 +197,8 @@ def parse_anthropic(reply: dict[str, Any]) -> tuple[str, list[dict[str, Any]], A
         stop = reply.get("stop_reason")
         usage = reply.get("usage") or {}
         call = AgentCall(reply.get("model"), _int(usage.get("input_tokens")), _int(usage.get("cache_creation_input_tokens")),
-                         _int(usage.get("cache_read_input_tokens")), _int(usage.get("output_tokens")), stop)
+                         _int(usage.get("cache_read_input_tokens")), _int(usage.get("output_tokens")), stop,
+                         usage_reported=bool(usage))
         if stop in REFUSAL_STOP_REASONS:
             raise AgentCallError("the model refused (stop reason: refusal)")
         if stop == "max_tokens":
@@ -232,13 +241,33 @@ def attempting(attempt: Attempt) -> Any:
         _attempt.reset(token)
 
 
+def counting(send: Send) -> Send:
+    """``send`` that counts, in the running attempt, every request actually dispatched (put beneath the retries)."""
+
+    def counted(provider: str, api_key: str, request: dict[str, Any]) -> dict[str, Any]:
+        attempt = _attempt.get()
+        if attempt is not None:
+            attempt.usage.dispatches += 1
+        return send(provider, api_key, request)
+
+    return counted
+
+
 def policy_with_instruction(policy: str, instruction: str | None) -> str:
     """Upstream's policy; with ``--instructions``, the file's text after it, in the policy part."""
     return policy if instruction is None else f"{policy}\n\n{instruction}"
 
 
+_registration = threading.Lock()
+
+
 def register_agent() -> None:
     """Register ``BlaAgent`` in upstream's registry under ``AGENT_NAME`` (once); upstream then builds it as it builds its own."""
+    with _registration:
+        _register_agent()
+
+
+def _register_agent() -> None:
     registry = load().registry
     if AGENT_NAME in registry._agent_factories:
         return
@@ -291,6 +320,9 @@ def make_agent_class() -> type:
                 except Exception as error:
                     if FIRST_MESSAGE_ERROR not in str(error) or not items or items[0]["role"] != "assistant":
                         raise
+                    # What litellm's Anthropic translation does under ``modify_params`` (a "." user turn first); without
+                    # it upstream's own agent fails on every conversation, as the API wants a user turn first.
+                    self.usage.opening_turn_added = True
                     reply = self.send("anthropic", self.api_key, anthropic_request(self.model, system, items, tools, opening=True))
                 parse = parse_anthropic
             try:
@@ -313,10 +345,11 @@ def make_agent_class() -> type:
             if self.provider == "openai":
                 cached = _int((usage.get("input_tokens_details") or {}).get("cached_tokens"))
                 call = AgentCall(reply.get("model"), max(_int(usage.get("input_tokens")) - cached, 0), 0, cached,
-                                 _int(usage.get("output_tokens")), reply.get("status"))
+                                 _int(usage.get("output_tokens")), reply.get("status"), usage_reported=bool(usage))
             else:
                 call = AgentCall(reply.get("model"), _int(usage.get("input_tokens")), _int(usage.get("cache_creation_input_tokens")),
-                                 _int(usage.get("cache_read_input_tokens")), _int(usage.get("output_tokens")), reply.get("stop_reason"))
+                                 _int(usage.get("cache_read_input_tokens")), _int(usage.get("output_tokens")), reply.get("stop_reason"),
+                                 usage_reported=bool(usage))
             self.usage.calls.append(call)
 
     return BlaAgent

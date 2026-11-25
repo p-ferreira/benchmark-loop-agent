@@ -129,6 +129,26 @@ def fake_fields(outcome, reason=None, calls=1):
             "customer_usage": {"calls": 0, "models": []}, "judges_usage": {"calls": 0, "models": []}, "elapsed_seconds": 0.1}
 
 
+def upstream_schemas(agent) -> list[dict]:
+    """The tool schemas straight from an upstream agent's tools, not through bla's helper."""
+    return [tool.openai_schema for tool in agent.tools]
+
+
+def sent_differences(request: dict, provider: str, standard) -> list[str]:
+    """What differs between a captured provider request and upstream's standard agent: system prompt and tools."""
+    found = []
+    expected = upstream_schemas(standard)
+    if provider == "openai":
+        system, sent = request["instructions"], [(t["name"], t["description"], t["parameters"]) for t in request["tools"]]
+    else:
+        system, sent = request["system"][0]["text"], [(t["name"], t["description"], t["input_schema"]) for t in request["tools"]]
+    if system != standard.system_prompt:
+        found.append("system prompt")
+    if sent != [(t["function"]["name"], t["function"]["description"], t["function"]["parameters"]) for t in expected]:
+        found.append("tool definitions")
+    return found
+
+
 def differences(ours, standard) -> list[str]:
     """What differs between bla's agent and upstream's standard agent: the system prompt and the tool definitions."""
     found = []
@@ -136,7 +156,7 @@ def differences(ours, standard) -> list[str]:
         found.append("system prompt")
     if ours.get_init_state().system_messages != standard.get_init_state().system_messages:
         found.append("initial system messages")
-    if json.dumps(tau_agent.tool_definitions(ours.tools), sort_keys=True) != json.dumps(tau_agent.tool_definitions(standard.tools), sort_keys=True):
+    if json.dumps(upstream_schemas(ours), sort_keys=True) != json.dumps(upstream_schemas(standard), sort_keys=True):
         found.append("tool definitions")
     return found
 
@@ -166,27 +186,38 @@ class AgentMatchesUpstreamTests(Base):
         ours, standard = self.agents("36", instruction="Always be brief.")
         self.assertEqual(differences(ours, standard), ["system prompt", "initial system messages"])
         ours, standard = self.agents("36")
-        altered = tau_agent.tool_definitions(ours.tools)
+        ours.tools[0].__class__  # noqa: B018
+        altered = upstream_schemas(ours)
         altered[0]["function"]["description"] += " "
-        with mock.patch.object(tau_agent, "tool_definitions", side_effect=[altered, tau_agent.tool_definitions(standard.tools)]):
+        with mock.patch.object(type(ours.tools[0]), "openai_schema", new_callable=mock.PropertyMock,
+                               side_effect=altered + upstream_schemas(standard)):
             self.assertEqual(differences(ours, standard), ["tool definitions"])
 
-    def test_what_is_sent_is_that_prompt_and_those_tools_on_both_providers(self):
+    def test_a_changed_tool_description_in_the_adapter_fails_the_request_comparison(self):
         _, standard = self.agents("36")
-        tools = tau_agent.tool_definitions(standard.tools)
+        real = tau_agent.tool_definitions
+
+        def wrong(tools):
+            schemas = real(tools)
+            schemas[0] = {**schemas[0], "function": {**schemas[0]["function"], "description": "wrong"}}
+            return schemas
+
         for provider in ("openai", "anthropic"):
+            self.directory = self.directory.parent / ("wrong-" + provider)
             send = ScriptedAgent(TASK, provider)
-            self.directory = self.directory.parent / provider
-            self.run_retail(send=send, provider=provider)
-            request = send.requests[0]
-            if provider == "openai":
-                self.assertEqual(request["instructions"], standard.system_prompt)
-                self.assertEqual([(t["name"], t["description"], t["parameters"]) for t in request["tools"]],
-                                 [(t["function"]["name"], t["function"]["description"], t["function"]["parameters"]) for t in tools])
-            else:
-                self.assertEqual(request["system"][0]["text"], standard.system_prompt)
-                self.assertEqual([(t["name"], t["description"], t["input_schema"]) for t in request["tools"]],
-                                 [(t["function"]["name"], t["function"]["description"], t["function"]["parameters"]) for t in tools])
+            with mock.patch.object(tau_agent, "tool_definitions", wrong):
+                self.run_retail(send=send, provider=provider)
+            self.assertEqual(sent_differences(send.requests[0], provider, standard), ["tool definitions"])
+
+    def test_what_is_sent_is_that_prompt_and_those_tools_on_both_providers(self):
+        for task_id in ("36", "22"):
+            _, standard = self.agents(task_id)
+            for provider in ("openai", "anthropic"):
+                task = task_of(task_id)
+                send = ScriptedAgent(task, provider)
+                self.directory = self.directory.parent / f"{provider}-{task_id}"
+                self.run_retail(send=send, provider=provider, task_ids=(task_id,), completion=ScriptedLitellm(task))
+                self.assertEqual(sent_differences(send.requests[0], provider, standard), [])
 
     def test_the_conversation_sent_is_upstreams(self):
         send = ScriptedAgent(TASK)
@@ -322,7 +353,103 @@ class OutcomeTests(Base):
         self.assertIsNone(record["reward"])
         self.assertIn("ValueError", record["reason"])
         self.assertNotIn(AGENT_KEY, json.dumps(record))
-        self.assertEqual(record["agent_calls"], 0)
+        self.assertEqual((record["agent_calls"], record["agent_calls_without_usage"]), (1, 1))  # one request, no usage back
+
+    def test_transport_retries_and_rejected_greetings_are_dispatches(self):
+        import openai
+
+        class Transient(openai.APIConnectionError):
+            def __init__(self):
+                super().__init__(request=mock.Mock())
+
+        attempts = []
+
+        def flaky(provider, key, request):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise Transient()
+            return openai_reply(text=FINAL_TEXT)
+
+        self.run_retail(send=flaky, completion=ScriptedLitellm(TASK))
+        record = self.records()[0]
+        self.assertEqual((record["agent_calls"], record["agent_calls_without_usage"]), (len(attempts), 1))
+        calls = []
+
+        def rejecting(provider, key, request):
+            calls.append(request)
+            if len(calls) == 1:
+                raise ValueError("messages: first message must use the user role")
+            return anthropic_reply(text=FINAL_TEXT)
+
+        self.directory = self.directory.parent / "greeting"
+        self.run_retail(send=rejecting, provider="anthropic")
+        record = self.records()[0]
+        self.assertEqual((record["agent_calls"], record["agent_calls_without_usage"], record["agent_opening_user_turn_added"]),
+                         (len(calls), 1, True))
+
+    def test_a_reply_without_usage_is_unknown_not_zero(self):
+        def silent(provider, key, request):
+            reply = openai_reply(text=FINAL_TEXT)
+            del reply["usage"]
+            return reply
+
+        self.run_retail(send=silent, completion=ScriptedLitellm(TASK))
+        record = self.records()[0]
+        self.assertEqual((record["agent_calls"], record["agent_calls_without_usage"]), (1, 1))
+        self.assertIn("usage unknown for 1 agent call(s)", build_report(self.directory, Path(__file__).resolve().parent.parent / "data" / "rates.json"))
+
+    def test_a_customer_refusal_is_unscored_and_keeps_its_usage(self):
+        from tests.tau_support import model_response
+        base = ScriptedLitellm(TASK)
+
+        def refusing(*args, **kwargs):
+            if kwargs["model"].endswith("gpt-6-sol"):
+                reply = model_response("I cannot help with that.", prompt=30, completion=4)
+                reply.choices[0].finish_reason = "content_filter"
+                reply.choices[0].message.refusal = "I cannot help with that."
+                return reply
+            return base(*args, **kwargs)
+
+        self.run_retail(completion=refusing)
+        record = self.records()[0]
+        self.assertEqual((record["outcome"], record["reward"]), ("unscored", None))
+        self.assertIn("refused", record["reason"])
+        self.assertEqual(record["customer_usage"]["models"][0]["prompt_tokens"], 30)
+
+    def test_a_judge_failure_keeps_the_finished_conversation(self):
+        base = ScriptedLitellm(TASK)
+
+        def failing(*args, **kwargs):
+            if not kwargs["model"].endswith("gpt-6-sol"):
+                raise RuntimeError("judge down")
+            return base(*args, **kwargs)
+
+        self.run_retail(completion=failing)
+        record = self.records()[0]
+        self.assertEqual(record["outcome"], "unscored")
+        conversation = json.loads((self.directory / batch.CONVERSATIONS_FILE).read_text().splitlines()[0])
+        self.assertFalse(conversation["partial"])
+        self.assertEqual(conversation["messages"][-1]["role"], "user")  # the customer's stop message is kept
+        self.assertIn("###STOP###", conversation["messages"][-1]["content"])
+
+    def test_a_key_in_a_reported_model_name_is_not_written(self):
+        base = ScriptedLitellm(TASK)
+
+        def echoing(*args, **kwargs):
+            reply = base(*args, **kwargs)
+            reply.model = f"echo-{AGENT_KEY}"
+            return reply
+
+        self.run_retail(completion=echoing)
+        for path in self.directory.iterdir():
+            self.assertNotIn(AGENT_KEY, path.read_text())
+
+    def test_an_instruction_holding_a_key_is_refused_before_any_request(self):
+        sent = []
+        with self.assertRaisesRegex(ValueError, "instruction text contains"):
+            self.run_retail(send=lambda *a: sent.append(a), instruction=f"use {AGENT_KEY}")
+        self.assertEqual(sent, [])
+        self.assertFalse(self.directory.exists())
 
     def test_a_refusal_is_unscored_and_its_tokens_are_kept(self):
         refusal = {"model": "m", "status": "completed", "output": [{"type": "message", "content": [{"type": "refusal", "refusal": "no"}]}],
@@ -398,6 +525,41 @@ class ResumeTests(Base):
         (record,) = self.records()
         self.assertEqual((record["outcome"], record["attempt"], len(record["earlier_unscored_attempts"])), ("unscored", 3, 2))
 
+    def test_a_stop_between_the_two_writes_does_not_schedule_the_scored_conversation_again(self):
+        class Stopped(BaseException):
+            pass
+
+        def stop(store):
+            raise Stopped()
+
+        with mock.patch.object(batch.Store, "_write_records", stop), self.assertRaises(Stopped):
+            self.run_retail()
+        self.assertEqual(self.records(), [])  # records.jsonl never got the record; the conversations file holds it
+        second = ScriptedAgent(TASK)
+        self.run_retail(send=second)
+        self.assertEqual(second.requests, [])
+        (record,) = self.records()
+        self.assertEqual((record["outcome"], record["attempt"]), ("pass", 1))
+        self.assertEqual(len((self.directory / batch.CONVERSATIONS_FILE).read_text().splitlines()), 1)
+
+    def test_usage_is_still_recorded_while_the_workers_are_shut_down_after_an_interrupt(self):
+        seen = []
+        original = UP.llm_utils.completion
+
+        class Pool(batch.ThreadPoolExecutor):
+            def map(self, *args, **kwargs):
+                raise KeyboardInterrupt()
+
+            def shutdown(self, *args, **kwargs):
+                seen.append(UP.llm_utils.completion is not original and UP.llm_utils.completion is not scripted)
+                super().shutdown(*args, **kwargs)
+
+        scripted = ScriptedLitellm(TASK)
+        with mock.patch.object(batch, "ThreadPoolExecutor", Pool), self.assertRaises(KeyboardInterrupt):
+            self.run_retail(completion=scripted)
+        self.assertEqual(seen, [True])  # the wrapper was still installed when shutdown ran
+        self.assertIs(UP.llm_utils.completion, original)  # and is gone afterwards
+
     def test_different_options_over_an_existing_directory_are_refused(self):
         self.run_retail()
         for changes in ({"model": "other"}, {"provider": "anthropic"}, {"trials": 2}, {"instruction": "x"}, {"user_model": "gpt-6-luna"},
@@ -405,7 +567,11 @@ class ResumeTests(Base):
             with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, "different options"):
                 self.run_retail(**changes)
         self.assertEqual(len(self.records()), 1)
-        self.run_retail(concurrency=3)  # the concurrency may change
+        sent = []
+        with self.assertRaisesRegex(ValueError, "different options"):  # the concurrency is part of the options
+            self.run_retail(send=lambda *a: sent.append(a), concurrency=3)
+        self.assertEqual(sent, [])
+        self.run_retail()
         self.assertEqual(len(batch.read_manifest(self.directory)["sessions"]), 2)
 
 
@@ -484,6 +650,25 @@ class ReportTests(Base):
         self.assertIn("- total spent: $19.3700", text)
         self.assertIn("  - attempts that gave a result: $14.3700", text)
         self.assertIn("(1 still unscored, 0 earlier unscored attempt(s) of conversations since scored or retried): $5.0000", text)
+
+    def test_unscored_and_earlier_attempts_have_their_own_token_table_even_without_rates(self):
+        earlier = [{**record("a", 0, "unscored", agent=(7, 0, 0, 3), customer=(0, 0, 0)), "earlier_unscored_attempts": []}]
+        records = [record("a", 0, "pass", earlier=earlier, attempt=2), record("b", 0, "unscored", agent=(11, 0, 0, 5))]
+        text = self.report(records, rates={"models": {}})
+        table = text.split("## Tokens, from unscored attempts")[1].split("## Cost")[0]
+        self.assertIn("1 still unscored, 1 earlier unscored attempt(s)", table)
+        self.assertIn("| agent | 6 | 18 | 0 | 0 | 8 |", table)
+
+    def test_usage_gaps_make_a_cost_a_lower_bound_and_customer_cache_writes_are_counted(self):
+        gap = record("a", 0, "pass", agent=(0, 0, 0, 0), customer=(0, 0, 0))
+        gap["agent_calls_without_usage"] = 2
+        text = self.report([gap])
+        self.assertIn("- cost per scored conversation: unknown (at least: usage unknown for 2 agent call(s))", text)
+        self.assertNotIn("none (no tokens used)\n  - customer", text.split("  - agent:")[1][:0] + "x")
+        written = record("a", 0, "pass", customer=(0, 0, 0))
+        written["customer_usage"]["models"][0].update(prompt_tokens=1_000_000, cached_tokens=0, cache_creation_tokens=400_000, completion_tokens=0)
+        items = report.usage_items(written, "agent-m")
+        self.assertEqual(items[1][2], {"uncached_input": 600_000, "cache_write_input": 400_000, "cache_read_input": 0, "output": 0})
 
     def test_cached_customer_tokens_without_a_cache_rate_are_not_priced_at_the_input_rate(self):
         text = self.report([record("a", 0, "pass", customer=(2_000_000, 500_000, 1_000_000))])

@@ -22,6 +22,7 @@ from ..providers import Send
 from ..retry import with_retries
 from ..runner import PROVIDERS
 from . import upstream
+from .agent import counting, register_agent
 from .conversation import Settings, customer_model_route, run_attempt
 from .usage import recording
 
@@ -46,7 +47,7 @@ class RunParameters:
     concurrency: int = 4
 
     def identity(self) -> dict[str, Any]:
-        """Everything that decides which conversations a directory holds (not the concurrency)."""
+        """Everything that decides which conversations a directory holds and how they were run."""
         return {
             "benchmark": BENCHMARK,
             "upstream": upstream.identity(),
@@ -57,6 +58,7 @@ class RunParameters:
             "user_model": self.user_model,
             "customer_reasoning": {"reasoning_effort": "low"},
             "trials": self.trials,
+            "concurrency": self.concurrency,
             "seed": self.seed,
             "trial_seeds": trial_seeds(self.seed, self.trials),
             "instructions": digest(self.instruction) if self.instruction is not None else None,
@@ -111,6 +113,28 @@ class Store:
         self._lock = threading.Lock()
         self.records: dict[tuple[str, int], dict[str, Any]] = {
             (r["task_id"], r["trial"]): r for r in read_jsonl(directory / RECORDS_FILE) if "task_id" in r and "trial" in r}
+        self._recover()
+
+    def _recover(self) -> None:
+        """conversations.jsonl is the authoritative commit: each line holds the attempt's whole record.
+
+        An interruption between that append and the replacement of records.jsonl leaves a record that
+        the conversations file is ahead of; it is restored from the file, never scheduled again.
+        """
+        changed = False
+        for line in read_jsonl(self.directory / CONVERSATIONS_FILE):
+            record = line.get("record")
+            if not isinstance(record, dict) or "task_id" not in record or "trial" not in record:
+                continue
+            key = (record["task_id"], record["trial"])
+            if key not in self.records or record.get("attempt", 0) > self.records[key].get("attempt", 0):
+                self.records[key] = record
+                changed = True
+        if changed:
+            self._write_records()
+
+    def _write_records(self) -> None:
+        _write_atomically(self.directory / RECORDS_FILE, "".join(json.dumps(r) + "\n" for r in self.records.values()))
 
     def pending(self, task_ids: Sequence[str], trials: int) -> list[tuple[str, int]]:
         """Conversations that are missing or unscored; a scored one is never repeated."""
@@ -130,13 +154,13 @@ class Store:
             record = {"task_id": task_id, "trial": trial, "seed": seed, "attempt": attempt, **fields,
                       "earlier_unscored_attempts": earlier}
             line = json.dumps({"task_id": task_id, "trial": trial, "attempt": attempt, "outcome": fields["outcome"],
-                               "reason": fields.get("reason"), **conversation}) + "\n"
-            with (self.directory / CONVERSATIONS_FILE).open("a") as file:  # first: a record never lacks its conversation
+                               "reason": fields.get("reason"), **conversation, "record": record}) + "\n"
+            with (self.directory / CONVERSATIONS_FILE).open("a") as file:  # the one commit: it holds the record too
                 file.write(line)
                 file.flush()
                 os.fsync(file.fileno())
             self.records[(task_id, trial)] = record
-            _write_atomically(self.directory / RECORDS_FILE, "".join(json.dumps(r) + "\n" for r in self.records.values()))
+            self._write_records()
             return record
 
 
@@ -158,6 +182,8 @@ def check_environment(parameters: RunParameters, environment: Mapping[str, str])
             raise ValueError(f"{variable} is not set (the agent, the customer and the judges need "
                              f"{key_env} and {CUSTOMER_KEY_ENV})")
     keys = [environment.get(p.key_env) for p in PROVIDERS.values()]
+    if parameters.instruction is not None and any(key and key in parameters.instruction for key in keys):
+        raise ValueError("the instruction text contains a configured API key; refusing to record it")
     for model in (parameters.agent_model, parameters.user_model):
         if any(key and key in model for key in keys):
             raise ValueError("a model ID contains a configured API key; refusing to record it")
@@ -175,7 +201,7 @@ def run_retail(directory: Path, parameters: RunParameters, environment: Mapping[
     previous = read_manifest(directory)
     if previous is not None and previous["parameters"] != identity:
         raise ValueError(f"{directory} holds a run with different options; use a new --output-dir or repeat the "
-                         "original provider, models, tasks, trials, seed and instruction text")
+                         "original provider, models, tasks, trials, concurrency, seed and instruction text")
     config, tasks = upstream.prepare(list(parameters.task_ids), parameters.agent_model, customer_model_route(parameters.user_model),
                                      parameters.trials, parameters.seed)
     store = Store(directory)
@@ -191,7 +217,8 @@ def run_retail(directory: Path, parameters: RunParameters, environment: Mapping[
                                "ended_at": None, "wall_seconds": None}
     write_manifest(directory, identity, session, run_id)
     started = time.perf_counter()
-    retrying = with_retries(send, sleep=sleep)
+    retrying = with_retries(counting(send), sleep=sleep)  # counted beneath the retries: every dispatch is a call
+    register_agent()  # once, before any worker starts
 
     def work(job: tuple[str, int]) -> None:
         task_id, trial = job
@@ -200,10 +227,14 @@ def run_retail(directory: Path, parameters: RunParameters, environment: Mapping[
 
     pool = ThreadPoolExecutor(max_workers=max(1, parameters.concurrency))
     try:
+        # The usage wrapper stays installed until the workers have stopped: on an interrupt the running
+        # conversations still call the customer and the judges, and those calls must be recorded.
         with recording(upstream.load().llm_utils, upstream.load().simulation_module):
-            list(pool.map(work, pending))
+            try:
+                list(pool.map(work, pending))
+            finally:
+                pool.shutdown(wait=True, cancel_futures=True)
     finally:
-        pool.shutdown(wait=True, cancel_futures=True)
         session.update(ended_at=now(), wall_seconds=round(time.perf_counter() - started, 3))
         write_manifest(directory, identity, session, run_id)
     return [store.records[key] for key in sorted(store.records) if key[0] in parameters.task_ids and key[1] < parameters.trials]

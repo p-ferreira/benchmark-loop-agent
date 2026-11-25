@@ -28,11 +28,28 @@ def usage_items(record: dict[str, Any], agent_model: str) -> list[tuple[str, str
     items = [("agent", agent_model, dict(record["agent_tokens"]))]
     for component, key in (("customer", "customer_usage"), ("judges", "judges_usage")):
         for entry in record[key]["models"]:
-            cached = entry["cached_tokens"]
+            cached, written = entry["cached_tokens"], entry.get("cache_creation_tokens", 0)
             items.append((component, entry["model"], {
-                "uncached_input": max(entry["prompt_tokens"] - cached, 0), "cache_write_input": 0,
+                "uncached_input": max(entry["prompt_tokens"] - cached - written, 0), "cache_write_input": written,
                 "cache_read_input": cached, "output": entry["completion_tokens"]}))
     return items
+
+
+def unknown_calls(record: dict[str, Any]) -> dict[str, int]:
+    """Calls of one attempt whose reply carried no usage, by component: their tokens are unknown, not zero."""
+    unknown = {"agent": record.get("agent_calls_without_usage", 0)}
+    for component, key in (("customer", "customer_usage"), ("judges", "judges_usage")):
+        unknown[component] = sum(entry.get("calls_without_usage", 0) for entry in record[key]["models"])
+    return {component: count for component, count in unknown.items() if count}
+
+
+def gaps_of(records: Iterable[dict[str, Any]], components: tuple[str, ...] = COMPONENTS) -> dict[str, int]:
+    total: dict[str, int] = {}
+    for record in records:
+        for component, count in unknown_calls(record).items():
+            if component in components:
+                total[component] = total.get(component, 0) + count
+    return total
 
 
 def price(items: Iterable[tuple[str, str, dict[str, int]]], rates: dict[str, dict[str, Any]],
@@ -56,13 +73,19 @@ def price(items: Iterable[tuple[str, str, dict[str, int]]], rates: dict[str, dic
 
 
 def money(value: float | None, unpriced: list[str], items: Iterable[tuple[str, str, dict[str, int]]] = (), divisor: int = 1,
-          components: tuple[str, ...] = COMPONENTS) -> str:
-    """A dollar figure, "not priced" with what lacks a rate, or "none" when no tokens were used at all (nothing to price)."""
+          components: tuple[str, ...] = COMPONENTS, gaps: dict[str, int] | None = None) -> str:
+    """A dollar figure, "not priced" with what lacks a rate, or "none" when no tokens were used at all (nothing to price).
+
+    ``gaps`` are the calls whose usage is unknown: a figure over them is a lower bound and says so.
+    """
+    note = ""
+    if gaps:
+        note = " (at least: usage unknown for " + ", ".join(f"{count} {component} call(s)" for component, count in gaps.items()) + ")"
     if value is None:
-        return "not priced (no rate for: " + "; ".join(unpriced) + ")"
+        return "not priced (no rate for: " + "; ".join(unpriced) + ")" + note
     if not any(count for component, _, tokens in items if component in components for count in tokens.values()):
-        return "none (no tokens used)"
-    return f"${value / divisor:.4f}"
+        return "unknown" + note if gaps else "none (no tokens used)"
+    return f"${value / divisor:.4f}" + note
 
 
 def attempts(record: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -76,6 +99,7 @@ def pass_hat_k(trials: int, successes: int, k: int) -> float:
 
 
 def tokens_table(records: list[dict[str, Any]]) -> list[str]:
+    """Calls and tokens by component; ``calls`` include those whose usage was not reported, listed under the table."""
     agent = {kind: sum(r["agent_tokens"][kind] for r in records) for kind in RATE_KEYS}
     lines = ["| Component | Calls | Uncached input | Cache write | Cache read | Output |", "| --- | --- | --- | --- | --- | --- |",
              f"| agent | {sum(r['agent_calls'] for r in records)} | {agent['uncached_input']} | {agent['cache_write_input']} | "
@@ -84,14 +108,20 @@ def tokens_table(records: list[dict[str, Any]]) -> list[str]:
         models: dict[str, dict[str, int]] = {}
         for record in records:
             for entry in record[key]["models"]:
-                total = models.setdefault(entry["model"], {"calls": 0, "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0})
+                total = models.setdefault(entry["model"], {"calls": 0, "prompt_tokens": 0, "cached_tokens": 0, "cache_creation_tokens": 0,
+                                                           "completion_tokens": 0})
                 for name in total:
-                    total[name] += entry[name]
+                    total[name] += entry.get(name, 0)
         for model, total in sorted(models.items()):
-            lines.append(f"| {component} `{model}` | {total['calls']} | {max(total['prompt_tokens'] - total['cached_tokens'], 0)} | 0 | "
-                         f"{total['cached_tokens']} | {total['completion_tokens']} |")
+            lines.append(f"| {component} `{model}` | {total['calls']} | "
+                         f"{max(total['prompt_tokens'] - total['cached_tokens'] - total['cache_creation_tokens'], 0)} | "
+                         f"{total['cache_creation_tokens']} | {total['cached_tokens']} | {total['completion_tokens']} |")
         if not models:
             lines.append(f"| {component} | 0 | 0 | 0 | 0 | 0 |")
+    gaps = gaps_of(records)
+    if gaps:
+        lines += ["", "Usage unknown (the reply carried none), so the counts above are lower bounds: "
+                  + ", ".join(f"{count} {component} call(s)" for component, count in gaps.items()) + "."]
     return lines
 
 
@@ -145,26 +175,31 @@ def build_report(directory: Path, rates_path: Path = RATES_FILE) -> str:
         out += [f"| {r['task_id']} | {r['trial']} | {r['attempt']} | {(r.get('reason') or '').replace('|', '/')} |" for r in unscored]
     else:
         out.append("None.")
+    earlier_attempts = [e for r in mine for e in attempts(r)[1]]
     out += ["", "## Tokens, from the attempts that gave the results", ""] + tokens_table(scored)
+    out += ["", f"## Tokens, from unscored attempts ({len(unscored)} still unscored, {len(earlier_attempts)} earlier unscored attempt(s) "
+            "of conversations since scored or retried)", ""] + tokens_table(unscored + earlier_attempts)
     out += ["", "## Cost", "", f"Rates: `{rates_path}` (US dollars per 1 million tokens).", ""]
     scored_items = [i for r in scored for i in usage_items(r, agent_model)]
     if scored:
         total, unpriced = price(scored_items, rates)
-        out.append(f"- cost per scored conversation: {money(total, unpriced, scored_items, len(scored))}")
+        out.append(f"- cost per scored conversation: {money(total, unpriced, scored_items, len(scored), gaps=gaps_of(scored))}")
         for component in COMPONENTS:
             c_total, c_unpriced = price(scored_items, rates, (component,))
-            out.append(f"  - {component}: {money(c_total, c_unpriced, scored_items, len(scored), (component,))}")
+            out.append(f"  - {component}: "
+                       f"{money(c_total, c_unpriced, scored_items, len(scored), (component,), gaps_of(scored, (component,)))}")
     else:
         out.append("- cost per scored conversation: n/a (no scored conversation)")
     unscored_items = [i for r in unscored for i in usage_items(r, agent_model)]
-    earlier = [i for r in mine for e in attempts(r)[1] for i in usage_items(e, agent_model)]
-    earlier_count = sum(len(attempts(r)[1]) for r in mine)
+    earlier = [i for e in earlier_attempts for i in usage_items(e, agent_model)]
+    earlier_count = len(earlier_attempts)
     failed_items = unscored_items + earlier
     t_total, t_unpriced = price(scored_items + failed_items, rates)
     s_total, s_unpriced = price(scored_items, rates)
     u_total, u_unpriced = price(failed_items, rates)
-    out += ["", f"- total spent: {money(t_total, t_unpriced, scored_items + failed_items)}",
-            f"  - attempts that gave a result: {money(s_total, s_unpriced, scored_items)}",
+    failed_gaps = gaps_of(unscored + earlier_attempts)
+    out += ["", f"- total spent: {money(t_total, t_unpriced, scored_items + failed_items, gaps=gaps_of(scored + unscored + earlier_attempts))}",
+            f"  - attempts that gave a result: {money(s_total, s_unpriced, scored_items, gaps=gaps_of(scored))}",
             f"  - unscored attempts, shown apart ({len(unscored)} still unscored, {earlier_count} earlier unscored attempt(s) of "
-            f"conversations since scored or retried): {money(u_total, u_unpriced, failed_items)}", ""]
+            f"conversations since scored or retried): {money(u_total, u_unpriced, failed_items, gaps=failed_gaps)}", ""]
     return "\n".join(out) + "\n"

@@ -13,7 +13,7 @@ from ..providers import Send
 from ..runner import PROVIDERS, redact
 from .agent import AgentCallError, AgentUsage, Attempt, attempting, register_agent
 from .upstream import load
-from .usage import CUSTOMER, JUDGES, UsageCollector, collecting
+from .usage import CUSTOMER, JUDGES, ModelRefusal, UsageCollector, collecting
 
 # Upstream scores a conversation that ended because someone stopped it, or because it reached its
 # step limit (reward 0: a fail). Every other end is a premature termination by error: unscored.
@@ -62,15 +62,22 @@ def run_attempt(config: Any, task: Any, seed: int, settings: Settings, environme
                            reward_components=_components(info))
     except AgentCallError as error:
         outcome["reason"] = f"agent call failed: {error}"
+    except ModelRefusal as error:
+        outcome["reason"] = str(error)
     except Exception as error:  # a provider error of the customer or the judges, or anything upstream raises
         who = "judges" if collector.phase == JUDGES else "conversation (customer, tools or agent)"
         outcome["reason"] = f"{who}: {type(error).__name__}: {error}"
     if outcome["reason"]:
         outcome["reason"] = redact(outcome["reason"], secrets)[:MAX_REASON_LENGTH]
     totals = usage.totals()
+    if simulation is None:
+        simulation = collector.simulation  # the judges failed: keep the finished conversation they were given
+    partial = simulation is None
     fields = {
         **outcome,
-        "agent_calls": len(usage.calls),
+        "agent_calls": usage.dispatches,
+        "agent_calls_without_usage": usage.calls_without_usage(),
+        "agent_opening_user_turn_added": usage.opening_turn_added,
         "agent_models": usage.models(),
         "agent_tokens": {"uncached_input": totals["uncached_input_tokens"], "cache_write_input": totals["cache_write_input_tokens"],
                          "cache_read_input": totals["cache_read_input_tokens"], "output": totals["output_tokens"]},
@@ -78,9 +85,9 @@ def run_attempt(config: Any, task: Any, seed: int, settings: Settings, environme
         "judges_usage": collector.summary(JUDGES),
         "elapsed_seconds": round(time.perf_counter() - started, 3),
     }
-    conversation = {"messages": _messages(simulation, usage), "partial": simulation is None, "reward_info": _reward_info(simulation),
+    conversation = {"messages": _messages(simulation, usage), "partial": partial, "reward_info": _reward_info(simulation),
                     "agent_call_usage": [call.to_dict() for call in usage.calls]}
-    return {"fields": fields, "conversation": redact(conversation, secrets)}
+    return {"fields": redact(fields, secrets), "conversation": redact(conversation, secrets)}
 
 
 def _components(info: Any) -> dict[str, Any]:
