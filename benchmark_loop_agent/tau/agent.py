@@ -38,7 +38,7 @@ class AgentCall:
     output_tokens: int
     stop_reason: str | None = None
     latency_seconds: float = 0.0
-    usage_reported: bool = True  # False: the reply carried no usage, so the zeros above are unknown, not measured
+    usage_reported: bool = True  # False: the reply carried no usage or only part of it, so some zeros above are unknown, not measured
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -162,6 +162,10 @@ def _int(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
+def _complete(usage: dict[str, Any]) -> bool:
+    """Both token totals were reported (cache details may be legitimately absent); a partial usage is not complete."""
+    return all(isinstance(usage.get(k), int) and not isinstance(usage.get(k), bool) for k in ("input_tokens", "output_tokens"))
+
 def parse_openai(reply: dict[str, Any]) -> tuple[str, list[dict[str, Any]], AgentCall]:
     try:
         if reply.get("status") not in (None, "completed"):
@@ -186,7 +190,7 @@ def parse_openai(reply: dict[str, Any]) -> tuple[str, list[dict[str, Any]], Agen
         usage = reply.get("usage") or {}
         cached = _int((usage.get("input_tokens_details") or {}).get("cached_tokens"))
         call = AgentCall(reply.get("model"), max(_int(usage.get("input_tokens")) - cached, 0), 0, cached,
-                         _int(usage.get("output_tokens")), reply.get("status"), usage_reported=bool(usage))
+                         _int(usage.get("output_tokens")), reply.get("status"), usage_reported=_complete(usage))
         return "".join(texts), calls, call
     except (KeyError, TypeError, AttributeError) as error:
         raise AgentCallError(f"unexpected OpenAI response shape: {type(error).__name__}: {error}") from None
@@ -198,7 +202,7 @@ def parse_anthropic(reply: dict[str, Any]) -> tuple[str, list[dict[str, Any]], A
         usage = reply.get("usage") or {}
         call = AgentCall(reply.get("model"), _int(usage.get("input_tokens")), _int(usage.get("cache_creation_input_tokens")),
                          _int(usage.get("cache_read_input_tokens")), _int(usage.get("output_tokens")), stop,
-                         usage_reported=bool(usage))
+                         usage_reported=_complete(usage))
         if stop in REFUSAL_STOP_REASONS:
             raise AgentCallError("the model refused (stop reason: refusal)")
         if stop == "max_tokens":
@@ -345,11 +349,11 @@ def make_agent_class() -> type:
             if self.provider == "openai":
                 cached = _int((usage.get("input_tokens_details") or {}).get("cached_tokens"))
                 call = AgentCall(reply.get("model"), max(_int(usage.get("input_tokens")) - cached, 0), 0, cached,
-                                 _int(usage.get("output_tokens")), reply.get("status"), usage_reported=bool(usage))
+                                 _int(usage.get("output_tokens")), reply.get("status"), usage_reported=_complete(usage))
             else:
                 call = AgentCall(reply.get("model"), _int(usage.get("input_tokens")), _int(usage.get("cache_creation_input_tokens")),
                                  _int(usage.get("cache_read_input_tokens")), _int(usage.get("output_tokens")), reply.get("stop_reason"),
-                                 usage_reported=bool(usage))
+                                 usage_reported=_complete(usage))
             self.usage.calls.append(call)
 
     return BlaAgent

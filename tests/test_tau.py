@@ -138,13 +138,18 @@ def sent_differences(request: dict, provider: str, standard) -> list[str]:
     """What differs between a captured provider request and upstream's standard agent: system prompt and tools."""
     found = []
     expected = upstream_schemas(standard)
-    if provider == "openai":
-        system, sent = request["instructions"], [(t["name"], t["description"], t["parameters"]) for t in request["tools"]]
-    else:
-        system, sent = request["system"][0]["text"], [(t["name"], t["description"], t["input_schema"]) for t in request["tools"]]
+    functions = [t["function"] for t in expected]
+    if provider == "openai":  # the Responses API form: every field, strictness included
+        system = request["instructions"]
+        wanted = [{"type": "function", "name": f["name"], "description": f["description"], "parameters": f["parameters"],
+                   "strict": False} for f in functions]
+    else:  # Anthropic's form; the cache breakpoint sits on the last tool
+        system = request["system"][0]["text"]
+        wanted = [{"name": f["name"], "description": f["description"], "input_schema": f["parameters"]} for f in functions]
+        wanted[-1]["cache_control"] = {"type": "ephemeral"}
     if system != standard.system_prompt:
         found.append("system prompt")
-    if sent != [(t["function"]["name"], t["function"]["description"], t["function"]["parameters"]) for t in expected]:
+    if request["tools"] != wanted:
         found.append("tool definitions")
     return found
 
@@ -208,6 +213,23 @@ class AgentMatchesUpstreamTests(Base):
             with mock.patch.object(tau_agent, "tool_definitions", wrong):
                 self.run_retail(send=send, provider=provider)
             self.assertEqual(sent_differences(send.requests[0], provider, standard), ["tool definitions"])
+
+    def test_a_changed_strictness_or_type_in_the_sent_tools_fails_the_request_comparison(self):
+        _, standard = self.agents("36")
+        for provider in ("openai", "anthropic"):
+            self.directory = self.directory.parent / ("flag-" + provider)
+            send = ScriptedAgent(TASK, provider)
+            self.run_retail(send=send, provider=provider)
+            request = json.loads(json.dumps(send.requests[0]))
+            self.assertEqual(sent_differences(request, provider, standard), [])
+            if provider == "openai":
+                request["tools"][0]["strict"] = True
+            else:
+                request["tools"][0]["cache_control"] = {"type": "ephemeral"}
+            self.assertEqual(sent_differences(request, provider, standard), ["tool definitions"])
+            request["tools"][0].pop("strict", None)
+            request["tools"][0]["type"] = "custom"
+            self.assertEqual(sent_differences(request, provider, standard), ["tool definitions"])
 
     def test_what_is_sent_is_that_prompt_and_those_tools_on_both_providers(self):
         for task_id in ("36", "22"):
@@ -398,6 +420,18 @@ class OutcomeTests(Base):
         self.assertEqual((record["agent_calls"], record["agent_calls_without_usage"]), (1, 1))
         self.assertIn("usage unknown for 1 agent call(s)", build_report(self.directory, Path(__file__).resolve().parent.parent / "data" / "rates.json"))
 
+    def test_a_partial_usage_keeps_its_known_tokens_and_is_flagged(self):
+        from benchmark_loop_agent.tau.usage import UsageCollector
+        collector = UsageCollector()
+        collector.add("gpt-6-sol", {"model": "gpt-6-sol", "usage": {"prompt_tokens": 30}})
+        (entry,) = collector.summary("customer")["models"]
+        self.assertEqual((entry["prompt_tokens"], entry["completion_tokens"], entry["calls_without_usage"]), (30, 0, 1))
+        from benchmark_loop_agent.tau.agent import parse_openai
+        reply = openai_reply(text=FINAL_TEXT)
+        del reply["usage"]["output_tokens"]
+        _, _, call = parse_openai(reply)
+        self.assertFalse(call.usage_reported)
+
     def test_a_customer_refusal_is_unscored_and_keeps_its_usage(self):
         from tests.tau_support import model_response
         base = ScriptedLitellm(TASK)
@@ -541,6 +575,41 @@ class ResumeTests(Base):
         (record,) = self.records()
         self.assertEqual((record["outcome"], record["attempt"]), ("pass", 1))
         self.assertEqual(len((self.directory / batch.CONVERSATIONS_FILE).read_text().splitlines()), 1)
+
+    def test_a_torn_journal_tail_does_not_swallow_the_retry(self):
+        self.run_retail()
+        journal = self.directory / batch.CONVERSATIONS_FILE
+        (self.directory / batch.RECORDS_FILE).unlink()
+        journal.write_text('{"task_id": ')  # a stop in the middle of the first append; nothing was committed
+        self.run_retail(send=ScriptedAgent(TASK))
+        entries = batch.read_jsonl(journal)
+        self.assertEqual([(e["task_id"], e["outcome"]) for e in entries], [(TASK_ID, "pass")])  # the retry's transcript is readable
+        self.assertTrue(journal.read_text().startswith('{"task_id": \n'))
+
+    def test_a_torn_tail_then_a_stop_before_the_index_is_written_does_not_repeat_the_trial(self):
+        class Stopped(BaseException):
+            pass
+
+        journal = self.directory / batch.CONVERSATIONS_FILE
+        self.directory.mkdir(parents=True)
+        journal.write_text('{"task_id": ')
+        with mock.patch.object(batch.Store, "_write_records", lambda store: (_ for _ in ()).throw(Stopped())), self.assertRaises(Stopped):
+            self.run_retail()
+        second = ScriptedAgent(TASK)
+        self.run_retail(send=second)
+        self.assertEqual(second.requests, [])
+        (record,) = self.records()
+        self.assertEqual((record["outcome"], record["attempt"]), ("pass", 1))
+
+    def test_the_report_reads_a_committed_result_the_index_has_not_got_yet(self):
+        class Stopped(BaseException):
+            pass
+
+        with mock.patch.object(batch.Store, "_write_records", lambda store: (_ for _ in ()).throw(Stopped())), self.assertRaises(Stopped):
+            self.run_retail()
+        self.assertEqual(self.records(), [])
+        text = build_report(self.directory, Path(__file__).resolve().parent.parent / "data" / "rates.json")
+        self.assertIn("scored: 1; unscored: 0", text)
 
     def test_usage_is_still_recorded_while_the_workers_are_shut_down_after_an_interrupt(self):
         seen = []

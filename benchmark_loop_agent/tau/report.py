@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ..dataset import DATA_DIR
-from .batch import CONVERSATIONS_FILE, MANIFEST_FILE, RECORDS_FILE, SCORED, read_jsonl, read_manifest
+from .batch import CONVERSATIONS_FILE, MANIFEST_FILE, RECORDS_FILE, SCORED, read_jsonl, read_manifest, recovered_records
 
 RATES_FILE = DATA_DIR / "rates.json"
 # token kind of a record -> the key of the rates file that prices it
@@ -120,7 +120,7 @@ def tokens_table(records: list[dict[str, Any]]) -> list[str]:
             lines.append(f"| {component} | 0 | 0 | 0 | 0 | 0 |")
     gaps = gaps_of(records)
     if gaps:
-        lines += ["", "Usage unknown (the reply carried none), so the counts above are lower bounds: "
+        lines += ["", "Usage unknown or incomplete (the reply carried none, or lacked a token total), so the counts above are lower bounds: "
                   + ", ".join(f"{count} {component} call(s)" for component, count in gaps.items()) + "."]
     return lines
 
@@ -132,7 +132,7 @@ def build_report(directory: Path, rates_path: Path = RATES_FILE) -> str:
     parameters = manifest["parameters"]
     rates = load_rates(rates_path)
     agent_model, trials, task_ids = parameters["agent_model"], parameters["trials"], parameters["task_ids"]
-    records = {(r["task_id"], r["trial"]): r for r in read_jsonl(directory / RECORDS_FILE)}
+    records, _ = recovered_records(directory)  # an interrupted run: the conversations file may be ahead of the index
     wanted = [(t, i) for t in task_ids for i in range(trials)]
     mine = [records[key] for key in wanted if key in records]
     scored = [r for r in mine if r["outcome"] in SCORED]

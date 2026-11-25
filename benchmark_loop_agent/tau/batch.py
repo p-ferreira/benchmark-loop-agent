@@ -104,6 +104,26 @@ def _write_atomically(path: Path, text: str) -> None:
     os.replace(temporary, path)
 
 
+def recovered_records(directory: Path) -> tuple[dict[tuple[str, int], dict[str, Any]], bool]:
+    """The records of a directory, and whether the conversations file was ahead of records.jsonl.
+
+    conversations.jsonl is the authoritative commit: each line holds the attempt's whole record.
+    An interruption between that append and the replacement of records.jsonl leaves a record that
+    the conversations file is ahead of; it is restored from the file, never scheduled again.
+    """
+    records = {(r["task_id"], r["trial"]): r for r in read_jsonl(directory / RECORDS_FILE) if "task_id" in r and "trial" in r}
+    changed = False
+    for line in read_jsonl(directory / CONVERSATIONS_FILE):
+        record = line.get("record")
+        if not isinstance(record, dict) or "task_id" not in record or "trial" not in record:
+            continue
+        key = (record["task_id"], record["trial"])
+        if key not in records or record.get("attempt", 0) > records[key].get("attempt", 0):
+            records[key] = record
+            changed = True
+    return records, changed
+
+
 class Store:
     """The records of a directory, one per (task, trial); thread safe."""
 
@@ -111,27 +131,26 @@ class Store:
         self.directory = directory
         directory.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self.records: dict[tuple[str, int], dict[str, Any]] = {
-            (r["task_id"], r["trial"]): r for r in read_jsonl(directory / RECORDS_FILE) if "task_id" in r and "trial" in r}
-        self._recover()
-
-    def _recover(self) -> None:
-        """conversations.jsonl is the authoritative commit: each line holds the attempt's whole record.
-
-        An interruption between that append and the replacement of records.jsonl leaves a record that
-        the conversations file is ahead of; it is restored from the file, never scheduled again.
-        """
-        changed = False
-        for line in read_jsonl(self.directory / CONVERSATIONS_FILE):
-            record = line.get("record")
-            if not isinstance(record, dict) or "task_id" not in record or "trial" not in record:
-                continue
-            key = (record["task_id"], record["trial"])
-            if key not in self.records or record.get("attempt", 0) > self.records[key].get("attempt", 0):
-                self.records[key] = record
-                changed = True
+        self._isolate_torn_tail()
+        self.records, changed = recovered_records(directory)
         if changed:
             self._write_records()
+
+    def _isolate_torn_tail(self) -> None:
+        """A stop in the middle of an append leaves a last line without its newline.
+
+        The next append would join it, and the joined line would be unreadable: the new entry lost.
+        A newline ends the torn line on its own (a whole entry that lacked only the newline becomes
+        readable); an unreadable one stays an ignored line of its own.
+        """
+        path = self.directory / CONVERSATIONS_FILE
+        if path.exists() and path.stat().st_size:
+            with path.open("rb+") as file:
+                file.seek(-1, os.SEEK_END)
+                if file.read(1) != b"\n":
+                    file.write(b"\n")
+                    file.flush()
+                    os.fsync(file.fileno())
 
     def _write_records(self) -> None:
         _write_atomically(self.directory / RECORDS_FILE, "".join(json.dumps(r) + "\n" for r in self.records.values()))

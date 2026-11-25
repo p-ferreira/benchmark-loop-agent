@@ -81,7 +81,7 @@ class UsageCollector:
             entry["calls"] += 1
             if call["reported_model"] and call["reported_model"] not in entry["reported_models"]:
                 entry["reported_models"].append(call["reported_model"])
-            if call["prompt_tokens"] is None and call["completion_tokens"] is None:
+            if call["prompt_tokens"] is None or call["completion_tokens"] is None:  # a partial usage is a lower bound too
                 entry["calls_without_usage"] += 1
             for key in ("prompt_tokens", "cached_tokens", "cache_creation_tokens", "completion_tokens", "reasoning_tokens"):
                 entry[key] += call[key] or 0
