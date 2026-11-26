@@ -1,0 +1,43 @@
+{
+  "parameters": {
+    "benchmark": "tau2-bench retail (text, English)",
+    "upstream": {
+      "repository": "sierra-research/tau2-bench",
+      "release": "v2.0.0",
+      "commit": "989d3285ae669e49503324bdb9981bf14fccedeb",
+      "benchmark": "text-v1",
+      "language": "en",
+      "domain": "retail"
+    },
+    "subset": {
+      "name": "retail_50",
+      "sha256": "dc7490f023d1bf9c345edf9c37a8e658298ac3a5be884e012bfb271b3678f2be"
+    },
+    "task_ids": [
+      "16"
+    ],
+    "provider": "anthropic",
+    "agent_model": "claude-haiku-5-5",
+    "user_model": "gpt-6-sol",
+    "customer_reasoning": {
+      "reasoning_effort": "low"
+    },
+    "trials": 1,
+    "concurrency": 4,
+    "seed": 300,
+    "trial_seeds": [
+      626729
+    ],
+    "instructions": null
+  },
+  "run_id": "5dca96b428b24362badaf0f739b7d493",
+  "sessions": [
+    {
+      "number": 1,
+      "concurrency": 4,
+      "started_at": "2026-11-26T00:28:46+00:00",
+      "ended_at": "2026-11-26T00:29:13+00:00",
+      "wall_seconds": 26.535
+    }
+  ]
+}
