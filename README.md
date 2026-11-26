@@ -563,6 +563,15 @@ Keys are read from `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` at run time and writ
 scrubbed of them). The agent's provider key and `OPENAI_API_KEY` must both be set, or the command stops before any request
 (exit code 2). Exit code 0: every conversation scored; 3: some `unscored`.
 
+**The finish check (`--finish-check`, off by default).** With it, bla holds a reply of the agent once and asks the model
+again, with a note, in two cases: the reply calls `transfer_to_human_agents` (once per conversation), or it is the reply to
+the customer after a call that changed something (once per change). The note quotes the held reply and asks the model to
+look again at the policy and its tools, or to go through every request the customer made; it says nothing about the task,
+and it is not kept in the conversation. What the model answers the second time is what the conversation gets: the same
+transfer made again goes through. `run.json` records `finish_check: true`, each record lists the replies held in
+`agent_checks`, the extra calls are counted in the agent's calls and tokens, and the report says the check was on. Without
+the option nothing changes: no field is added to `run.json` or to a record.
+
 **The task set.** `retail_50.json` must hash to the digest written in `benchmark_loop_agent/tau/upstream.py` **and** to the
 one upstream's manifest records for the subset (`dc7490f0…f2be`), and the 50 task identifiers are read from those very
 bytes; any other file is refused before any request. Upstream's own checks (its frozen-subset digest, that the canonical

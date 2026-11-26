@@ -822,3 +822,87 @@ from benchmark_loop_agent.tau.report import build_report  # noqa: E402
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FinishCheckTests(Base):
+    """``--finish-check``: a reply is held once and asked again before a hand-over, and before the reply after a change."""
+
+    def run_checked(self, send, finish_check=True, completion=None):
+        parameters = RunParameters("openai", "agent-model", "gpt-6-sol", (TASK_ID,), 1, 300, None, 1, finish_check)
+        with mock.patch.object(UP.llm_utils, "completion", completion or ScriptedLitellm(TASK)):
+            return run_retail(self.directory, parameters, environment("openai"), send)
+
+    @staticmethod
+    def note_of(request):
+        last = request["input"][-1]
+        return last["content"] if last.get("role") == "user" and tau_agent.CHECK_HEADER in last["content"] else None
+
+    def handing_over(self, again=False):
+        """A ``Send`` that hands over first; asked again it either helps or makes the same transfer; then it says it is done."""
+        requests = []
+
+        def send(provider, api_key, request):
+            requests.append(request)
+            transferred = any(i.get("type") == "function_call_output" for i in request["input"])
+            spoken = sum(1 for i in request["input"] if i.get("role") == "assistant") > 1
+            if self.note_of(request) is not None:
+                return openai_reply(calls=[("transfer_to_human_agents", {"summary": "wants a change"})]) if again else openai_reply(text="Let me look at that for you.")
+            if transferred or spoken:
+                return openai_reply(text=FINAL_TEXT)
+            return openai_reply(calls=[("transfer_to_human_agents", {"summary": "wants a change"})])
+
+        return send, requests
+
+    def test_a_hand_over_is_held_once_and_the_second_reply_is_what_the_conversation_gets(self):
+        send, requests = self.handing_over()
+        self.run_checked(send)
+        note = self.note_of(requests[1])
+        self.assertIn("transfer the customer to a human agent", note)
+        self.assertIn('"wants a change"', note)
+        self.assertEqual(requests[1]["input"][:-1], requests[0]["input"])  # the same conversation, plus the note
+        self.assertEqual(requests[1]["instructions"], requests[0]["instructions"])
+        self.assertEqual(requests[1]["tools"], requests[0]["tools"])
+        record = self.records()[0]
+        self.assertEqual(record["agent_checks"], ["handover"])
+        self.assertEqual(record["agent_calls"], len(requests))
+        conversation = (self.directory / batch.CONVERSATIONS_FILE).read_text()
+        self.assertNotIn("transfer_to_human_agents", conversation)  # the held call never reached the tools
+        self.assertNotIn(tau_agent.CHECK_HEADER, conversation)  # the note is not part of the conversation
+        self.assertTrue(all(self.note_of(r) is None for r in requests[2:]))
+        self.assertIs(batch.read_manifest(self.directory)["parameters"]["finish_check"], True)
+
+    def test_the_same_transfer_made_again_goes_through_and_is_not_held_twice(self):
+        send, requests = self.handing_over(again=True)
+        self.run_checked(send)
+        self.assertEqual(self.records()[0]["agent_checks"], ["handover"])
+        self.assertIn("transfer_to_human_agents", (self.directory / batch.CONVERSATIONS_FILE).read_text())
+        self.assertEqual(sum(1 for r in requests if self.note_of(r) is not None), 1)
+
+    def test_the_reply_after_a_change_is_held_once_and_a_reply_without_a_change_is_not(self):
+        send = ScriptedAgent(TASK)
+        records = self.run_checked(send)
+        self.assertEqual(records[0]["outcome"], "pass")
+        self.assertEqual(self.records()[0]["agent_checks"], ["requests"])
+        notes = [self.note_of(r) for r in send.requests]
+        self.assertEqual(sum(1 for n in notes if n is not None), 1)
+        self.assertIn(json.dumps(FINAL_TEXT), notes[-1])
+        self.assertIn("every request the customer has made", notes[-1])
+        self.assertIsNone(notes[0])  # the first reply follows no change
+
+    def test_without_the_option_nothing_is_held_and_the_records_are_as_before(self):
+        send, requests = self.handing_over()
+        self.run_checked(send, finish_check=False)
+        self.assertTrue(all(self.note_of(r) is None for r in requests))
+        self.assertNotIn("agent_checks", self.records()[0])
+        self.assertNotIn("finish_check", batch.read_manifest(self.directory)["parameters"])
+
+    def test_the_option_is_part_of_what_a_directory_holds(self):
+        self.run_checked(ScriptedAgent(TASK), finish_check=False)
+        with self.assertRaises(ValueError):
+            self.run_checked(ScriptedAgent(TASK), finish_check=True)
+
+    def test_the_report_says_the_check_was_on_and_how_many_replies_it_held(self):
+        from benchmark_loop_agent.tau.report import RATES_FILE, build_report
+        self.run_checked(ScriptedAgent(TASK))
+        self.assertIn("- finish check: on", build_report(self.directory, RATES_FILE))
+        self.assertIn("replies held: 1", build_report(self.directory, RATES_FILE))

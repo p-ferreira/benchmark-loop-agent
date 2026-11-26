@@ -45,9 +45,16 @@ class RunParameters:
     seed: int = 300  # upstream's default seed
     instruction: str | None = None
     concurrency: int = 4
+    finish_check: bool = False
 
     def identity(self) -> dict[str, Any]:
         """Everything that decides which conversations a directory holds and how they were run."""
+        identity = self._identity()
+        if self.finish_check:  # written only when on, so that a run without it records what it always did
+            identity["finish_check"] = True
+        return identity
+
+    def _identity(self) -> dict[str, Any]:
         return {
             "benchmark": BENCHMARK,
             "upstream": upstream.identity(),
@@ -226,7 +233,7 @@ def run_retail(directory: Path, parameters: RunParameters, environment: Mapping[
     previous = read_manifest(directory)
     if previous is not None and previous["parameters"] != identity:
         raise ValueError(f"{directory} holds a run with different options; use a new --output-dir or repeat the "
-                         "original provider, models, tasks, trials, concurrency, seed and instruction text")
+                         "original provider, models, tasks, trials, concurrency, seed, instruction text and finish check")
     config, tasks = upstream.prepare(list(parameters.task_ids), parameters.agent_model, customer_model_route(parameters.user_model),
                                      parameters.trials, parameters.seed)
     store = Store(directory)
@@ -234,7 +241,7 @@ def run_retail(directory: Path, parameters: RunParameters, environment: Mapping[
         (directory / INSTRUCTION_FILE).write_bytes(parameters.instruction.encode("utf-8"))
     pending = store.pending(parameters.task_ids, parameters.trials)
     seeds = trial_seeds(parameters.seed, parameters.trials)
-    settings = Settings(parameters.provider, parameters.agent_model, parameters.user_model, parameters.instruction)
+    settings = Settings(parameters.provider, parameters.agent_model, parameters.user_model, parameters.instruction, parameters.finish_check)
 
     number = len(previous["sessions"]) + 1 if previous else 1
     run_id = (previous or {}).get("run_id") or uuid.uuid4().hex
