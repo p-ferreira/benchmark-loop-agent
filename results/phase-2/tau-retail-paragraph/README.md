@@ -28,3 +28,5 @@ To regenerate a report and the comparison:
 
     uv run --locked python -m benchmark_loop_agent.tau --report results/phase-2/tau-retail-paragraph/control-haiku --rates results/phase-2/tau-retail-paragraph/rates-2026-11-26.json
     cd results/phase-2/tau-retail-paragraph && python3 compare.py control-haiku treatment-haiku
+
+`classify.py` classes every failed conversation of the three runs per model by what the agent did against the expected actions (handed over to a human, wrong detail, partial, written check failed). It was written after the figures above were fixed and is the starting evidence of the next item.
