@@ -234,7 +234,7 @@ def run_retail(directory: Path, parameters: RunParameters, environment: Mapping[
     previous = read_manifest(directory)
     if previous is not None and previous["parameters"] != identity:
         raise ValueError(f"{directory} holds a run with different options; use a new --output-dir or repeat the "
-                         "original provider, models, tasks, trials, concurrency, seed and instruction text")
+                         "original provider, domain, models, tasks, trials, concurrency, seed and instruction text")
     config, tasks = upstream.prepare(list(parameters.task_ids), parameters.agent_model, customer_model_route(parameters.user_model),
                                      parameters.trials, parameters.seed, domain=parameters.domain)
     store = Store(directory)

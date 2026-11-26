@@ -128,7 +128,7 @@ def tokens_table(records: list[dict[str, Any]]) -> list[str]:
 def build_report(directory: Path, rates_path: Path = RATES_FILE) -> str:
     manifest = read_manifest(directory)
     if manifest is None:
-        raise ValueError(f"{directory / MANIFEST_FILE} not found: not a retail run directory")
+        raise ValueError(f"{directory / MANIFEST_FILE} not found: not a τ-bench run directory")
     parameters = manifest["parameters"]
     rates = load_rates(rates_path)
     agent_model, trials, task_ids = parameters["agent_model"], parameters["trials"], parameters["task_ids"]

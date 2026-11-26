@@ -568,8 +568,8 @@ Keys are read from `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` at run time and writ
 scrubbed of them). The agent's provider key and `OPENAI_API_KEY` must both be set, or the command stops before any request
 (exit code 2). Exit code 0: every conversation scored; 3: some `unscored`.
 
-**The task set.** The subset file (`retail_50.json`; for airline `airline_50.json`, `055b5d4f…8db`) must hash to the digest written in `benchmark_loop_agent/tau/upstream.py` **and** to the
-one upstream's manifest records for the subset (`dc7490f0…f2be`), and the 50 task identifiers are read from those very
+**The task set.** The subset file (`retail_50.json`, or `airline_50.json` for airline) must hash to the digest written in `benchmark_loop_agent/tau/upstream.py` **and** to the
+one upstream's manifest records for that subset (retail `dc7490f0…f2be`, airline `055b5d4f…8db`), and the 50 task identifiers are read from those very
 bytes; any other file is refused before any request. Upstream's own checks (its frozen-subset digest, that the canonical
 frame and the draw reproduce the subset) run as well. `--tasks` accepts only identifiers of the domain's subset. For airline the binding the manifest records (`fe3df4be…5ddc`) is checked too, as for retail.
 `run.json` records the upstream commit, the subset name and digest, the models, the trial count, the seed (and each
