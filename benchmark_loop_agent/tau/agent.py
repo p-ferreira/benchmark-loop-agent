@@ -60,6 +60,7 @@ class AgentUsage:
     writes_checked: int = 0  # write calls of the conversation already covered by a requests check
     handover_offered: bool = False  # with ``--handover-rule``: the customer asked for a person, so the transfer tool was offered
     handover_refusals: int = 0  # with ``--handover-rule``: replies that announced a transfer without the tool and were asked again
+    handover_announced: int = 0  # with ``--handover-rule``: replies that still announced one after the asks, and went to the customer
 
     def totals(self) -> dict[str, int]:
         return {kind: sum(getattr(call, kind) for call in self.calls) for kind in TOKEN_KINDS}
@@ -319,24 +320,44 @@ def check_note(items: list[dict[str, Any]], text: str, calls: list[dict[str, Any
 # and nothing else: no task, no expected action, no score.
 
 ASKS_FOR_A_PERSON = re.compile(
-    r"\b(human|representative|supervisor|manager|real person|live (agent|person)|someone else|somebody else|"
-    r"another (agent|team|department|person)|different (agent|team|department)|escalat\w*|specialist|higher[- ]up)\b",
+    r"\b(human|representative|supervisor|manager|specialist|higher[- ]up|escalat\w*|"
+    r"(a|an|another|real|live|actual) (person|agent)|(some|any)(one|body) (else|who|that)|have (some|any)(one|body)|"
+    r"another (team|department)|different (agent|team|department|person)|"
+    r"(connect|transfer|put|pass|hand) me\b|(speak|talk) (to|with) (some|any)(one|body))\b",
     re.IGNORECASE)
-ANNOUNCES_TRANSFER = re.compile(r"transferred to a human agent", re.IGNORECASE)  # the sentence the policy has the agent send
+# "I don't want a supervisor" does not ask for one: a match that follows one of these, in the same sentence, is not counted.
+DECLINES_A_PERSON = re.compile(r"\b(don'?t|do not|didn'?t|did not|no need|not asking|never|without|rather not|won'?t)\b[^.?!]{0,40}$", re.IGNORECASE)
+# What the customer takes as being transferred: the policy's sentence, and other ways of saying it.
+ANNOUNCES_TRANSFER = re.compile(
+    r"\b(being transferred to|transferr(ed|ing) you|(transfer|connect|hand|pass|put)(ing)? you (now )?(to|with|over|off|through)|"
+    r"(escalat(e|ed|ing)|forward(ed|ing)?) (this|your|you))\b", re.IGNORECASE)
+# "I can't transfer you" announces nothing: a match that follows one of these, in the same sentence, is not counted.
+DENIES_TRANSFER = re.compile(r"\b(can'?t|cannot|can not|unable|not able|won'?t|will not|don'?t|do not|no way|not possible|isn'?t|is not)\b[^.?!]{0,40}$",
+                             re.IGNORECASE)
 HANDOVER_REASKS = 2
 HANDOVER_REFUSAL = (
     CHECK_HEADER + " A transfer to a human agent is not available at this point of the conversation: the customer has "
-    "not asked for a person. Do not announce a transfer. Tell the customer what you can and cannot do under the policy, "
-    "and continue with what you can do.")
+    "not asked for a person. Do not announce or promise a transfer. Tell the customer what you can and cannot do under "
+    "the policy, and continue with what you can do.")
 
 
 def customer_asked_for_a_person(items: list[dict[str, Any]]) -> bool:
-    """Whether a message of the customer, so far, asks for a person."""
-    return any(item["role"] == "user" and ASKS_FOR_A_PERSON.search(item["text"]) for item in items)
+    """Whether a message of the customer, so far, asks for a person (and does not say it wants none)."""
+    for item in items:
+        if item["role"] != "user":
+            continue
+        for match in ASKS_FOR_A_PERSON.finditer(item["text"]):
+            if not DECLINES_A_PERSON.search(item["text"][:match.start()]):
+                return True
+    return False
 
 
 def announces_handover(text: str, calls: list[dict[str, Any]]) -> bool:
-    return any(call["name"] == HANDOVER_TOOL for call in calls) or bool(ANNOUNCES_TRANSFER.search(text or ""))
+    """Whether the reply hands the customer over: a call to the transfer tool, or words that say a transfer is happening."""
+    if any(call["name"] == HANDOVER_TOOL for call in calls):
+        return True
+    text = text or ""
+    return any(not DENIES_TRANSFER.search(text[:match.start()]) for match in ANNOUNCES_TRANSFER.finditer(text))
 
 
 def policy_with_instruction(policy: str, instruction: str | None) -> str:
@@ -414,6 +435,8 @@ def make_agent_class() -> type:
                     text, calls = self._ask(system, [*items, {"role": "user", "text": HANDOVER_REFUSAL}], tools)
                 if any(call["name"] == HANDOVER_TOOL for call in calls):
                     raise AgentCallError("the model called the transfer tool, which was not among the tools it was sent")
+                if announces_handover(text, calls):
+                    self.usage.handover_announced += 1  # the customer will read a transfer that the tools never made
             if self.finish_check:
                 held = check_note(items, text, calls, write_tool_names(self.tools), self.usage)
                 if held is not None:

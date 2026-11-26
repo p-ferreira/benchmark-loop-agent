@@ -152,7 +152,8 @@ def build_report(directory: Path, rates_path: Path = RATES_FILE) -> str:
               if parameters.get("finish_check") else []),
             *(["- hand-over rule: on (the transfer tool is sent to the model only after the customer asks for a person); "
                f"conversations where it was offered: {sum(1 for r in mine if (r.get('agent_handover') or {}).get('offered'))}; "
-               f"replies asked again for announcing a transfer without it: {sum((r.get('agent_handover') or {}).get('refused_replies', 0) for r in mine)}"]
+               f"replies asked again for announcing a transfer without it: {sum((r.get('agent_handover') or {}).get('refused_replies', 0) for r in mine)}; "
+               f"announcements that reached the customer anyway: {sum((r.get('agent_handover') or {}).get('announced_without_tool', 0) for r in mine)}"]
               if parameters.get("handover_rule") else []),
             "", "## Conversations", "",
             f"- tasks: {len(task_ids)}; trials: {trials}; conversations asked for: {len(wanted)}",

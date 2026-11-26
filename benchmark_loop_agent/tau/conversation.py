@@ -90,7 +90,8 @@ def run_attempt(config: Any, task: Any, seed: int, settings: Settings, environme
     if settings.finish_check:
         fields["agent_checks"] = list(usage.checks)  # each reply that was held and asked again, by check
     if settings.handover_rule:  # whether the transfer tool was ever offered, and replies asked again for announcing one without it
-        fields["agent_handover"] = {"offered": usage.handover_offered, "refused_replies": usage.handover_refusals}
+        fields["agent_handover"] = {"offered": usage.handover_offered, "refused_replies": usage.handover_refusals,
+                                    "announced_without_tool": usage.handover_announced}
     conversation = {"messages": _messages(simulation, usage), "partial": partial, "reward_info": _reward_info(simulation),
                     "agent_call_usage": [call.to_dict() for call in usage.calls]}
     return {"fields": redact(fields, secrets), "conversation": redact(conversation, secrets)}

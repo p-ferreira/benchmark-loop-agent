@@ -933,9 +933,15 @@ class HandoverRuleTests(Base):
     def test_phrases_that_ask_for_a_person_and_phrases_that_do_not(self):
         asks = ["Can I speak to a supervisor?", "I want a human.", "Please escalate this.", "Get me your manager",
                 "Is there someone else who can help?", "a real person, please", "connect me to a REPRESENTATIVE",
-                "Is there another team for this?"]
+                "Is there another team for this?", "Please put me through to an agent.",
+                "If not, please transfer me to a person who can help.", "or connect me with someone who can look into it",
+                "Is there another way to find the placement dates or have someone review them?",
+                "I don't want to wait. Get me a supervisor.", "Can I talk to somebody about this?"]
         does_not = ["Can you refund the lost tablet?", "I want to change my order please.", "You are not helping me at all.",
-                    "Cancel it. I managed to find the order number.", "the humane thing to do", "Yes, go ahead."]
+                    "Cancel it. I managed to find the order number.", "the humane thing to do", "Yes, go ahead.",
+                    "I don't want a supervisor, just fix it.", "No need for a manager.", "Please don't transfer me.",
+                    "Can you put it on my card?", "Is that available? I'm trying not to spend more.",
+                    "My name is Chen Smith, and my ZIP code is 32278. Can you check the order now?"]
         for text in asks:
             self.assertTrue(tau_agent.customer_asked_for_a_person([{"role": "user", "text": text}]), text)
         for text in does_not:
@@ -956,7 +962,7 @@ class HandoverRuleTests(Base):
             self.assertEqual([t for t in without["tools"] if t["name"] != "transfer_to_human_agents"], with_rule["tools"])
             self.assertEqual(with_rule["instructions"], without["instructions"])
             self.assertEqual(with_rule["input"], without["input"])
-        self.assertEqual(self.records()[0]["agent_handover"], {"offered": False, "refused_replies": 0})
+        self.assertEqual(self.records()[0]["agent_handover"], {"offered": False, "refused_replies": 0, "announced_without_tool": 0})
         self.assertIs(batch.read_manifest(self.directory)["parameters"]["handover_rule"], True)
 
     def test_the_tool_is_sent_once_the_customer_has_asked_and_stays(self):
@@ -987,7 +993,25 @@ class HandoverRuleTests(Base):
             self.assertEqual(again["input"][:-1], first_turn[0]["input"])
             self.assertIn("not available", again["input"][-1]["content"])
         self.assertEqual(self.records()[0]["agent_handover"]["refused_replies"], 2)
+        self.assertEqual(self.records()[0]["agent_handover"]["announced_without_tool"], 1)  # it went out, and the record says so
         self.assertNotIn(tau_agent.CHECK_HEADER, (self.directory / batch.CONVERSATIONS_FILE).read_text())
+
+    def test_other_ways_of_announcing_a_transfer_are_caught_and_ordinary_replies_are_not(self):
+        for text in ("YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON.", "I'll connect you with a specialist now.",
+                     "I am transferring you to our team.", "Let me hand you over to a colleague.", "I'm escalating this for you.",
+                     "I will forward your case to the right team."):
+            self.assertTrue(tau_agent.announces_handover(text, []), text)
+        for text in ("I can't transfer you, but I can cancel the order.", "The refund will be transferred to your card.",
+                     "All done, the change is made.", "I cannot do that under the policy.", "Your order is connected to this address.",
+                     "I'm unable to connect you with a human agent right now.", "I won't be escalating this; here is what I can do."):
+            self.assertFalse(tau_agent.announces_handover(text, []), text)
+
+    def test_on_anthropic_the_tool_is_withheld_the_same_way(self):
+        send = ScriptedAgent(TASK, "anthropic")
+        self.run_ruled(send, provider="anthropic")
+        for request in send.requests:
+            self.assertNotIn("transfer_to_human_agents", [t["name"] for t in request["tools"]])
+            self.assertEqual(request["tools"][-1]["cache_control"], {"type": "ephemeral"})  # the breakpoint stays on the last tool sent
 
     def test_a_call_to_the_tool_that_was_not_sent_is_unscored_and_never_reaches_the_tools(self):
         def send(provider, api_key, request):
