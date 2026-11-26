@@ -23,3 +23,16 @@ live_irrelevance, live_relevance.
 
 Not copied from BFCL: vendor/bfcl_eval/constants/model_config.py is a small
 stand-in written for this repository (see the docstring in that file).
+
+This product also includes software and data from tau2-bench
+(https://github.com/sierra-research/tau2-bench), Copyright Sierra Research, licensed under the
+MIT License (see vendor/tau2_bench/LICENSE), release v2.0.0, commit
+989d3285ae669e49503324bdb9981bf14fccedeb. Copied unmodified:
+  src/tau2/                                    -> vendor/tau2_bench/src/tau2/   (the whole package)
+  LICENSE                                      -> vendor/tau2_bench/LICENSE
+  data/tau2/benchmarks/text.json               -> vendor/tau2_bench/data/tau2/benchmarks/
+  data/tau2/task_subsets/retail_50.json        -> vendor/tau2_bench/data/tau2/task_subsets/
+  data/tau2/domains/retail/{db.json,policy.md,tasks.json,split_tasks.json}
+                                               -> vendor/tau2_bench/data/tau2/domains/retail/
+  data/tau2/multilingual/en/                   -> vendor/tau2_bench/data/tau2/multilingual/en/
+The other files of upstream (other domains' data, other languages, voice, tests, documentation) are not copied.

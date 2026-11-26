@@ -13,9 +13,12 @@ Finished runs, with their records and reports, are in [`results/`](results/READM
 single-turn BFCL case on `gpt-6-sol` and `claude-opus-5-5`:
 [results/phase-0](results/phase-0/README.md).
 
+A second benchmark, [τ-bench retail](#τ-bench-retail), runs multi-turn conversations against upstream's simulated customer.
+
 ## Install
 
-Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/). Requests are
+Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/) for the BFCL part, and Python 3.12 for the
+[τ-bench retail part](#what-the-retail-part-needs) (the repository pins 3.12 in `.python-version`). Requests are
 made with the official `openai` and `anthropic` Python libraries.
 
 ```sh
@@ -492,6 +495,145 @@ selected no cases has no overall figure and is refused.
 ```sh
 uv run --locked python -m benchmark_loop_agent.report runs/a runs/b runs/c --output-dir runs/spread
 ```
+
+## τ-bench retail
+
+A second benchmark: the retail domain of [τ-bench](https://github.com/sierra-research/tau2-bench) (`tau2-bench`), run as
+multi-turn conversations. An **agent model that bla calls itself** talks with upstream's **simulated customer**, uses
+upstream's **retail tools**, and every conversation is scored by upstream's **evaluator**. One command runs the 50 frozen
+English tasks of upstream's text benchmark:
+
+```sh
+export OPENAI_API_KEY=...  ANTHROPIC_API_KEY=...   # the customer and the judges are OpenAI models, the agent's key is its provider's
+uv run --locked python -m benchmark_loop_agent.tau --output-dir runs/retail-haiku --provider anthropic \
+    --anthropic-model <model id> --trials 4 --concurrency 4
+uv run --locked python -m benchmark_loop_agent.tau --report runs/retail-haiku --rates rates-of-the-day.json
+```
+
+### What the retail part needs
+
+Upstream needs **Python 3.12** and more packages than the BFCL part (litellm, pandas, fastapi, ...). They are the
+`tau` dependency group of `pyproject.toml`, installed by default by `uv sync --locked` (the repository's
+`.python-version` is 3.12, which upstream's code needs: it uses `audioop`, gone from Python 3.13). The BFCL part is
+unchanged and still works on Python 3.10 and later without the group:
+
+```sh
+uv sync --locked --no-group tau --python 3.11   # BFCL only; the retail tests are then skipped, the report command still works
+```
+
+### Upstream, and what is whose
+
+* **Pinned upstream:** `sierra-research/tau2-bench`, release `v2.0.0`, commit `989d3285ae669e49503324bdb9981bf14fccedeb`
+  (MIT licence). The task set is the `retail_50` subset of `data/tau2/benchmarks/text.json` (benchmark `text-v1`,
+  language `en`).
+* **Vendored, unmodified:** `vendor/tau2_bench/src/tau2` is a byte-for-byte copy of upstream's `src/tau2`, with upstream's
+  `LICENSE`; `vendor/tau2_bench/data/tau2/` holds the data files the English retail text benchmark reads (the `text.json`
+  manifest, `retail_50.json`, the retail database, policy and tasks, the English language pack). Listed in `NOTICE`.
+* **Upstream's, used as it is:** the orchestrator, the retail environment and tools, the policy, the system-prompt
+  template (`LLMAgent`), the simulated customer and its prompts, the language-pack persona of each task, the evaluator
+  (database check and the two judges, at their defaults: the natural-language-assertions judge `gpt-5.4-mini-2026-03-17`
+  and the communicate-information judge `gpt-5.5`, both `reasoning_effort: low`), step and error limits (200 and 10), and
+  the way trials are seeded (`--seed`, default 300). Conversations run through upstream's own `run_single_task` on a run
+  config built as upstream's `resolve_configs` builds one for the `text-v1` English retail cell (it checks the binding
+  revision its manifest records).
+* **bla's:** the agent's model calls (`BlaAgent`, a subclass of upstream's `LLMAgent` that replaces only the model call),
+  prompt caching and token counting, the digest check, the records and resume, the report and the rates.
+* **Worked around:** the other 14 cells of upstream's manifest (other languages and domains) are not vendored, so upstream's
+  `resolve_configs` cannot run on the whole manifest; bla does its single-cell part itself. Upstream's customer is called
+  through litellm, which does not know the newest models' prices and logs an error line for each call; bla drops that one
+  line from the log (prices come from the rates file).
+
+### The command
+
+| Option | Meaning |
+|--------|---------|
+| `--output-dir DIR` | where `run.json`, `records.jsonl` and `conversations.jsonl` are written |
+| `--provider openai\|anthropic` | the agent's provider |
+| `--openai-model ID`, `--anthropic-model ID` | the agent's model ID; otherwise `OPENAI_MODEL` / `ANTHROPIC_MODEL` |
+| `--trials N` | conversations per task (default 1) |
+| `--concurrency N` | conversations in flight at once (default 4) |
+| `--tasks ID ...` / `--limit N` | a partial run: these tasks of `retail_50`, or its first N. Not both. Without either, the run is exactly the 50 tasks |
+| `--user-model ID` | upstream's simulated customer's model (default `gpt-6-sol`), with upstream's reasoning setting for it (`reasoning_effort: low`). An id without a route is an OpenAI model |
+| `--instructions FILE` | UTF-8 text, 1 to 8,000 bytes, appended after upstream's policy text inside the policy part of the system prompt; nothing else changes |
+| `--seed S` | the seed the trial seeds are drawn from (default 300, as upstream) |
+| `--report DIR` / `--rates FILE` | write the report of a run directory instead of running; the rates file (default `data/rates.json`) |
+
+Keys are read from `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` at run time and written nowhere (records and conversations are
+scrubbed of them). The agent's provider key and `OPENAI_API_KEY` must both be set, or the command stops before any request
+(exit code 2). Exit code 0: every conversation scored; 3: some `unscored`.
+
+**The task set.** `retail_50.json` must hash to the digest written in `benchmark_loop_agent/tau/upstream.py` **and** to the
+one upstream's manifest records for the subset (`dc7490f0…f2be`), and the 50 task identifiers are read from those very
+bytes; any other file is refused before any request. Upstream's own checks (its frozen-subset digest, that the canonical
+frame and the draw reproduce the subset) run as well. `--tasks` accepts only identifiers of `retail_50`.
+`run.json` records the upstream commit, the subset name and digest, the models, the trial count, the seed (and each
+trial's seed) and, with `--instructions`, the file's SHA-256 and byte length (the text is saved as `instructions.txt`).
+
+**What the agent is sent.** What upstream's standard text agent sends for the same task: its system prompt, built from the
+same policy (and the same language clause upstream's runner adds for English), the same tool definitions
+(`tool.openai_schema`, converted only into each provider's tool format) and the same conversation (upstream's greeting,
+the customer's messages, the agent's earlier messages and tool results). A test builds both agents with upstream's own
+orchestrator builder for two tasks and fails on any difference in the system prompt or the tools; further tests check
+that the request carries them. Calls: OpenAI Responses API (`instructions`, function tools, `store: false`), Anthropic
+Messages (`max_tokens` 8192). No temperature is sent. If the Messages API refuses a conversation that starts with
+upstream's assistant greeting ("first message must use the user role"), the same request is sent once more with a
+one-character user turn (".") before it. That is the translation litellm's Anthropic adapter makes when `modify_params`
+is on (it is off by default, so upstream's own agent would fail on Anthropic here); the record says when it happened
+(`agent_opening_user_turn_added`).
+
+**Caching.** Anthropic: `cache_control` on the system block, on the last tool and on the last block of the last
+message (so each call reads the previous call's prefix). OpenAI: caching is automatic for the stable prefix; every
+request carries a `prompt_cache_key` derived from the system prompt and the tools. Each agent call's tokens are recorded as
+the provider reports them: Anthropic's `input_tokens` (uncached), `cache_creation_input_tokens` (cache written) and
+`cache_read_input_tokens`, and `output_tokens`; OpenAI's `input_tokens` minus `input_tokens_details.cached_tokens`
+(uncached), `cached_tokens` (cache read; OpenAI reports no cache write, recorded as 0) and `output_tokens`.
+
+### Records
+
+`records.jsonl` has one record per task and trial:
+
+| Field | Meaning |
+|-------|---------|
+| `task_id`, `trial`, `seed`, `attempt` | what was run; the attempt that gave this record (1 for the first) |
+| `outcome` | `pass` (upstream's reward is 1), `fail` (a scored conversation with another reward, including one that reached upstream's step limit: reward 0) or `unscored` |
+| `reward`, `reward_components` | upstream's reward (`null` when unscored), and what its evaluator reports: `reward_breakdown`, `reward_basis`, `db_check`, `action_checks`, `env_assertions`, `communicate_checks`, `nl_assertions` and `info` |
+| `termination_reason`, `reason` | upstream's termination reason; for `unscored`, why |
+| `agent_calls`, `agent_calls_without_usage`, `agent_models`, `agent_tokens` | the requests the agent dispatched (each transport retry and each request the API rejected counts), how many of them have no reported usage (their tokens are unknown, not zero), the model names the provider reported, and the tokens `uncached_input`, `cache_write_input`, `cache_read_input`, `output` |
+| `customer_usage`, `judges_usage` | per model: `calls`, `prompt_tokens`, `cached_tokens`, `completion_tokens`, `cache_creation_tokens`, `reasoning_tokens`, `calls_without_usage` (as upstream's litellm replies report them) and the reported model names; a judge that was not needed (a task without natural-language assertions or required information) is simply absent |
+| `elapsed_seconds` | wall time of the attempt |
+| `earlier_unscored_attempts` | the same fields of each earlier attempt of this task and trial that ended `unscored` |
+
+**Unscored.** A conversation that ended in a provider error (of the agent, the customer or a judge), a refusal (the agent's, or an explicit refusal signal in a customer or judge reply: a `refusal` field or a `content_filter` finish; the call's usage is kept), or one of
+upstream's own terminations by error (`agent_error`, `user_error`, `too_many_errors`, `infrastructure_error`,
+`context_window_exceeded`, `timeout`, `unexpected_error`) is `unscored` with its reason, never a pass or a fail. Only
+`agent_stop`, `user_stop` and `max_steps` are scored. `conversations.jsonl` keeps the full conversation of every attempt
+(the messages, upstream's reward information and each agent call's tokens); an attempt that failed midway keeps what the agent
+had seen by then and is marked `partial`.
+
+**Running again** with the same `DIR` and options runs only the conversations that are missing or `unscored`; a scored one
+is never repeated; the full record is committed in the same line of `conversations.jsonl` that holds the conversation, so a
+stop between that line and the rewrite of `records.jsonl` is recovered at the next start. Different options (provider, models, tasks, trials, concurrency, seed, instruction text) over an existing `DIR` are
+refused. An instruction text that contains a configured key is refused too. When a rerun scores, the record holds the usage of the attempt that gave the result, and
+`earlier_unscored_attempts` the usage of each earlier unscored attempt.
+
+### Report
+
+`--report DIR` prints (and does not write) a Markdown report built from the run directory and the rates file only: tasks,
+trials, scored and unscored conversations; the pass rate over scored conversations; with more than one trial, the share of
+tasks passed in all `k` trials for each `k` up to the trial count (upstream's `pass^k`, the mean over tasks of
+`C(c, k) / C(n, k)`), over the tasks whose every trial is scored, with the tasks left out for an unscored or missing trial
+counted and named; the unscored conversations and their reasons; token totals by kind for the agent, the customer and the
+judges, for the attempts that gave the results and, apart, for unscored and earlier unscored attempts (also without rates); the cost per scored conversation (from the attempts that gave the results); and the total spent, which adds the
+unscored attempts, shown apart.
+
+**Rates.** `data/rates.json` is unchanged and no rate is written by bla. `--rates FILE` takes a file of the same form, in which
+a model may also have `cache_read` and `cache_write` rates (US dollars per 1 million tokens). A model with no rate, or tokens
+of a kind for which its model has no rate, are reported as *not priced*, never as zero and never at another kind's rate;
+a figure that includes one is *not priced*. A component that used no tokens at all shows *none*; a figure over calls whose reply carried no usage says *at least* and
+how many calls are unknown.
+
+The retail tests (`tests/test_tau.py`) use scripted stand-ins for the agent's provider, the customer and the judges, and a
+fixture of made-up rates; they need no key and no connection.
 
 ## Tests
 
