@@ -906,3 +906,106 @@ class FinishCheckTests(Base):
         self.run_checked(ScriptedAgent(TASK))
         self.assertIn("- finish check: on", build_report(self.directory, RATES_FILE))
         self.assertIn("replies held: 1", build_report(self.directory, RATES_FILE))
+
+
+class AskingCustomer(ScriptedLitellm):
+    """The customer of ``ScriptedLitellm``, whose opening message also asks for a supervisor."""
+
+    def __call__(self, *args, **kwargs):
+        reply = super().__call__(*args, **kwargs)
+        if kwargs["model"].endswith("gpt-6-sol") and reply.choices[0].message.content != "###STOP###":
+            reply.choices[0].message.content = "Hello, I would like to change my order. Can I speak to a supervisor about it?"
+        return reply
+
+
+class HandoverRuleTests(Base):
+    """``--handover-rule``: the transfer tool is sent only after the customer has asked for a person."""
+
+    def run_ruled(self, send, handover_rule=True, completion=None, provider="openai"):
+        parameters = RunParameters(provider, "agent-model", "gpt-6-sol", (TASK_ID,), 1, 300, None, 1, False, handover_rule)
+        with mock.patch.object(UP.llm_utils, "completion", completion or ScriptedLitellm(TASK)):
+            return run_retail(self.directory, parameters, environment(provider), send)
+
+    @staticmethod
+    def tool_names(request):
+        return [t["name"] for t in request["tools"]]
+
+    def test_phrases_that_ask_for_a_person_and_phrases_that_do_not(self):
+        asks = ["Can I speak to a supervisor?", "I want a human.", "Please escalate this.", "Get me your manager",
+                "Is there someone else who can help?", "a real person, please", "connect me to a REPRESENTATIVE",
+                "Is there another team for this?"]
+        does_not = ["Can you refund the lost tablet?", "I want to change my order please.", "You are not helping me at all.",
+                    "Cancel it. I managed to find the order number.", "the humane thing to do", "Yes, go ahead."]
+        for text in asks:
+            self.assertTrue(tau_agent.customer_asked_for_a_person([{"role": "user", "text": text}]), text)
+        for text in does_not:
+            self.assertFalse(tau_agent.customer_asked_for_a_person([{"role": "user", "text": text}]), text)
+        self.assertFalse(tau_agent.customer_asked_for_a_person([{"role": "assistant", "text": "I can get a supervisor.", "calls": []}]))
+
+    def test_the_transfer_tool_is_not_sent_until_the_customer_asks_and_nothing_else_changes(self):
+        plain = ScriptedAgent(TASK)
+        self.run_ruled(plain, handover_rule=False)
+        self.directory = self.directory.parent / "ruled"
+        ruled = ScriptedAgent(TASK)
+        records = self.run_ruled(ruled)
+        self.assertEqual(records[0]["outcome"], "pass")
+        self.assertEqual(len(ruled.requests), len(plain.requests))  # no extra call
+        for with_rule, without in zip(ruled.requests, plain.requests):
+            self.assertIn("transfer_to_human_agents", self.tool_names(without))
+            self.assertEqual(self.tool_names(with_rule), [n for n in self.tool_names(without) if n != "transfer_to_human_agents"])
+            self.assertEqual([t for t in without["tools"] if t["name"] != "transfer_to_human_agents"], with_rule["tools"])
+            self.assertEqual(with_rule["instructions"], without["instructions"])
+            self.assertEqual(with_rule["input"], without["input"])
+        self.assertEqual(self.records()[0]["agent_handover"], {"offered": False, "refused_replies": 0})
+        self.assertIs(batch.read_manifest(self.directory)["parameters"]["handover_rule"], True)
+
+    def test_the_tool_is_sent_once_the_customer_has_asked_and_stays(self):
+        for provider in ("openai", "anthropic"):
+            self.directory = self.directory.parent / provider
+            send = ScriptedAgent(TASK, provider)
+            self.run_ruled(send, completion=AskingCustomer(TASK), provider=provider)
+            self.assertGreater(len(send.requests), 1)
+            for request in send.requests:  # the customer asked in the first message: every request has the tool
+                self.assertIn("transfer_to_human_agents", [t["name"] for t in request["tools"]])
+            self.assertIs(self.records()[0]["agent_handover"]["offered"], True)
+
+    def test_a_reply_that_announces_a_transfer_without_the_tool_is_asked_again_at_most_twice(self):
+        requests = []
+
+        def send(provider, api_key, request):
+            requests.append(request)
+            said = sum(1 for i in request["input"] if i.get("role") == "assistant")
+            if said > 1:
+                return openai_reply(text=FINAL_TEXT)
+            return openai_reply(text="YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON.")
+
+        self.run_ruled(send)
+        first_turn = [r for r in requests if sum(1 for i in r["input"] if i.get("role") == "assistant") == 1]
+        self.assertEqual(len(first_turn), 3)  # the reply, and two more asks
+        self.assertNotIn(tau_agent.CHECK_HEADER, json.dumps(first_turn[0]["input"]))
+        for again in first_turn[1:]:
+            self.assertEqual(again["input"][:-1], first_turn[0]["input"])
+            self.assertIn("not available", again["input"][-1]["content"])
+        self.assertEqual(self.records()[0]["agent_handover"]["refused_replies"], 2)
+        self.assertNotIn(tau_agent.CHECK_HEADER, (self.directory / batch.CONVERSATIONS_FILE).read_text())
+
+    def test_a_call_to_the_tool_that_was_not_sent_is_unscored_and_never_reaches_the_tools(self):
+        def send(provider, api_key, request):
+            return openai_reply(calls=[("transfer_to_human_agents", {"summary": "x"})])
+
+        records = self.run_ruled(send)
+        self.assertEqual(records[0]["outcome"], "unscored")
+        self.assertIn("not among the tools", records[0]["reason"])
+        self.assertNotIn("Transfer successful", (self.directory / batch.CONVERSATIONS_FILE).read_text())
+
+    def test_without_the_option_the_records_are_as_before_and_the_option_is_part_of_a_directory(self):
+        self.run_ruled(ScriptedAgent(TASK), handover_rule=False)
+        self.assertNotIn("agent_handover", self.records()[0])
+        self.assertNotIn("handover_rule", batch.read_manifest(self.directory)["parameters"])
+        with self.assertRaises(ValueError):
+            self.run_ruled(ScriptedAgent(TASK), handover_rule=True)
+
+    def test_the_report_says_the_rule_was_on(self):
+        from benchmark_loop_agent.tau.report import RATES_FILE, build_report
+        self.run_ruled(ScriptedAgent(TASK))
+        self.assertIn("- hand-over rule: on", build_report(self.directory, RATES_FILE))

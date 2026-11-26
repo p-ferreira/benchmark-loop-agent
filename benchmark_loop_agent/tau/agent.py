@@ -9,6 +9,7 @@ prompt caching and counts the tokens each reply reports, by kind.
 import contextvars
 import hashlib
 import json
+import re
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -57,6 +58,8 @@ class AgentUsage:
     messages: list[Any] = field(default_factory=list)  # the agent's view of the conversation so far, for a failed attempt
     checks: list[str] = field(default_factory=list)  # with ``--finish-check``: each time a reply was held and asked again, which check
     writes_checked: int = 0  # write calls of the conversation already covered by a requests check
+    handover_offered: bool = False  # with ``--handover-rule``: the customer asked for a person, so the transfer tool was offered
+    handover_refusals: int = 0  # with ``--handover-rule``: replies that announced a transfer without the tool and were asked again
 
     def totals(self) -> dict[str, int]:
         return {kind: sum(getattr(call, kind) for call in self.calls) for kind in TOKEN_KINDS}
@@ -234,6 +237,7 @@ class Attempt:
     usage: AgentUsage
     instruction: str | None = None
     finish_check: bool = False
+    handover_rule: bool = False
 
 
 _attempt: contextvars.ContextVar[Attempt | None] = contextvars.ContextVar("tau_attempt", default=None)
@@ -307,6 +311,34 @@ def check_note(items: list[dict[str, Any]], text: str, calls: list[dict[str, Any
     return REQUESTS, REQUESTS_NOTE.format(held=json.dumps(text, ensure_ascii=False))
 
 
+# --- the hand-over rule (``--handover-rule``) -----------------------------------------------
+#
+# Off by default. With it, the transfer tool is not among the tools sent to the model until the
+# customer has asked for a person, in the customer's own words. Until then the model can decline
+# or carry on, but it cannot hand the conversation over. The rule reads the customer's messages
+# and nothing else: no task, no expected action, no score.
+
+ASKS_FOR_A_PERSON = re.compile(
+    r"\b(human|representative|supervisor|manager|real person|live (agent|person)|someone else|somebody else|"
+    r"another (agent|team|department|person)|different (agent|team|department)|escalat\w*|specialist|higher[- ]up)\b",
+    re.IGNORECASE)
+ANNOUNCES_TRANSFER = re.compile(r"transferred to a human agent", re.IGNORECASE)  # the sentence the policy has the agent send
+HANDOVER_REASKS = 2
+HANDOVER_REFUSAL = (
+    CHECK_HEADER + " A transfer to a human agent is not available at this point of the conversation: the customer has "
+    "not asked for a person. Do not announce a transfer. Tell the customer what you can and cannot do under the policy, "
+    "and continue with what you can do.")
+
+
+def customer_asked_for_a_person(items: list[dict[str, Any]]) -> bool:
+    """Whether a message of the customer, so far, asks for a person."""
+    return any(item["role"] == "user" and ASKS_FOR_A_PERSON.search(item["text"]) for item in items)
+
+
+def announces_handover(text: str, calls: list[dict[str, Any]]) -> bool:
+    return any(call["name"] == HANDOVER_TOOL for call in calls) or bool(ANNOUNCES_TRANSFER.search(text or ""))
+
+
 def policy_with_instruction(policy: str, instruction: str | None) -> str:
     """Upstream's policy; with ``--instructions``, the file's text after it, in the policy part."""
     return policy if instruction is None else f"{policy}\n\n{instruction}"
@@ -333,7 +365,7 @@ def _register_agent() -> None:
             raise RuntimeError("bla's agent is built only inside an attempt")
         return agent_class(tools, policy_with_instruction(domain_policy, attempt.instruction), provider=attempt.provider,
                            model=attempt.model, api_key=attempt.api_key, send=attempt.send, usage=attempt.usage,
-                           finish_check=attempt.finish_check)
+                           finish_check=attempt.finish_check, handover_rule=attempt.handover_rule)
 
     registry.register_agent_factory(factory, AGENT_NAME)
 
@@ -350,10 +382,10 @@ def make_agent_class() -> type:
         """Upstream's ``LLMAgent`` whose model call is made by bla's provider code."""
 
         def __init__(self, tools: list[Any], domain_policy: str, *, provider: str, model: str, api_key: str,
-                     send: Send, usage: AgentUsage, finish_check: bool = False):
+                     send: Send, usage: AgentUsage, finish_check: bool = False, handover_rule: bool = False):
             super().__init__(tools=tools, domain_policy=domain_policy, llm=model, llm_args=None)
             self.provider, self.model, self.api_key, self.send, self.usage = provider, model, api_key, send, usage
-            self.finish_check = finish_check
+            self.finish_check, self.handover_rule = finish_check, handover_rule
 
         def _generate_next_message(self, message: Any, state: Any) -> Any:
             if isinstance(message, UserMessage) and message.is_audio:
@@ -366,7 +398,22 @@ def make_agent_class() -> type:
             self.usage.messages = state.messages
             items = _messages(state.messages)
             tools = tool_definitions(self.tools)
+            withheld = False
+            if self.handover_rule:
+                if customer_asked_for_a_person(items):
+                    self.usage.handover_offered = True
+                else:
+                    tools = [tool for tool in tools if tool["function"]["name"] != HANDOVER_TOOL]
+                    withheld = True
             text, calls = self._ask(system, items, tools)
+            if withheld:
+                for _ in range(HANDOVER_REASKS):
+                    if not announces_handover(text, calls):
+                        break
+                    self.usage.handover_refusals += 1
+                    text, calls = self._ask(system, [*items, {"role": "user", "text": HANDOVER_REFUSAL}], tools)
+                if any(call["name"] == HANDOVER_TOOL for call in calls):
+                    raise AgentCallError("the model called the transfer tool, which was not among the tools it was sent")
             if self.finish_check:
                 held = check_note(items, text, calls, write_tool_names(self.tools), self.usage)
                 if held is not None:
