@@ -28,6 +28,7 @@ class Settings:
     agent_model: str
     user_model: str
     instruction: str | None = None
+    finish_check: bool = False
     max_steps: int = 200  # upstream's defaults
     max_errors: int = 10
 
@@ -46,7 +47,7 @@ def run_attempt(config: Any, task: Any, seed: int, settings: Settings, environme
                                "reason": None}
     simulation = None
     attempt = Attempt(settings.provider, settings.agent_model, environment.get(PROVIDERS[settings.provider].key_env, ""), send,
-                      usage, settings.instruction)
+                      usage, settings.instruction, settings.finish_check)
     try:
         upstream = load()
         register_agent()
@@ -85,6 +86,8 @@ def run_attempt(config: Any, task: Any, seed: int, settings: Settings, environme
         "judges_usage": collector.summary(JUDGES),
         "elapsed_seconds": round(time.perf_counter() - started, 3),
     }
+    if settings.finish_check:
+        fields["agent_checks"] = list(usage.checks)  # each reply that was held and asked again, by check
     conversation = {"messages": _messages(simulation, usage), "partial": partial, "reward_info": _reward_info(simulation),
                     "agent_call_usage": [call.to_dict() for call in usage.calls]}
     return {"fields": redact(fields, secrets), "conversation": redact(conversation, secrets)}

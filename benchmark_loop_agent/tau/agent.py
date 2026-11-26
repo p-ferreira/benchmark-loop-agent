@@ -55,6 +55,8 @@ class AgentUsage:
     dispatches: int = 0  # requests actually sent: transport retries and requests the API rejected count, replies or not
     opening_turn_added: bool = False  # the Anthropic retry that prepends a user turn happened
     messages: list[Any] = field(default_factory=list)  # the agent's view of the conversation so far, for a failed attempt
+    checks: list[str] = field(default_factory=list)  # with ``--finish-check``: each time a reply was held and asked again, which check
+    writes_checked: int = 0  # write calls of the conversation already covered by a requests check
 
     def totals(self) -> dict[str, int]:
         return {kind: sum(getattr(call, kind) for call in self.calls) for kind in TOKEN_KINDS}
@@ -231,6 +233,7 @@ class Attempt:
     send: Send
     usage: AgentUsage
     instruction: str | None = None
+    finish_check: bool = False
 
 
 _attempt: contextvars.ContextVar[Attempt | None] = contextvars.ContextVar("tau_attempt", default=None)
@@ -255,6 +258,53 @@ def counting(send: Send) -> Send:
         return send(provider, api_key, request)
 
     return counted
+
+
+# --- the finish check (``--finish-check``) -------------------------------------------------
+#
+# Off by default. With it, a reply of the agent is held once and the model is asked again, with a
+# note, in two cases: the reply hands the customer to a human, or it is the reply to the customer
+# after a call that changed something. The note is built from the reply itself and says nothing
+# about the task; the model's second reply is what the conversation gets. The note is not kept in
+# the conversation.
+
+HANDOVER_TOOL = "transfer_to_human_agents"
+HANDOVER = "handover"
+REQUESTS = "requests"
+CHECK_HEADER = "Check by the system. This is not a message from the customer, and the customer does not see it."
+HANDOVER_NOTE = (
+    CHECK_HEADER + " You were about to transfer the customer to a human agent, with this summary: {held}\n"
+    "A transfer ends your work on this conversation. Before it goes through, look once more at the policy and at "
+    "your tools. If what the customer asked for can be done with your tools within the policy, do that instead and "
+    "continue the conversation. If the policy requires the transfer, make the same transfer call again.")
+REQUESTS_NOTE = (
+    CHECK_HEADER + " You were about to send this reply: {held}\n"
+    "Before it goes out, go through every request the customer has made in this conversation and check each one "
+    "against the tool results above: done, refused under the policy, or still open. If a request is still open and "
+    "the policy allows it, continue with it now (ask the customer for what you need, or make the call) instead of "
+    "this reply. If every request is handled, send your reply.")
+
+
+def write_tool_names(tools: list[Any]) -> set[str]:
+    """The tools upstream marks as changing state."""
+    return {tool.name for tool in tools if getattr(getattr(getattr(tool, "_func", None), "__tool_type__", None), "value", None) == "write"}
+
+
+def check_note(items: list[dict[str, Any]], text: str, calls: list[dict[str, Any]], writes: set[str],
+               usage: AgentUsage) -> tuple[str, str] | None:
+    """Which check holds this reply, and its note; ``None`` when the reply goes through as it is."""
+    for call in calls:
+        if call["name"] == HANDOVER_TOOL:
+            if HANDOVER in usage.checks:
+                return None  # asked once already in this conversation: the transfer goes through
+            return HANDOVER, HANDOVER_NOTE.format(held=json.dumps(call["arguments"].get("summary", ""), ensure_ascii=False))
+    if calls or not text:
+        return None
+    written = sum(1 for item in items if item["role"] == "assistant" for call in item["calls"] if call["name"] in writes)
+    if written <= usage.writes_checked:
+        return None  # nothing was changed since the last check
+    usage.writes_checked = written
+    return REQUESTS, REQUESTS_NOTE.format(held=json.dumps(text, ensure_ascii=False))
 
 
 def policy_with_instruction(policy: str, instruction: str | None) -> str:
@@ -282,7 +332,8 @@ def _register_agent() -> None:
         if attempt is None:
             raise RuntimeError("bla's agent is built only inside an attempt")
         return agent_class(tools, policy_with_instruction(domain_policy, attempt.instruction), provider=attempt.provider,
-                           model=attempt.model, api_key=attempt.api_key, send=attempt.send, usage=attempt.usage)
+                           model=attempt.model, api_key=attempt.api_key, send=attempt.send, usage=attempt.usage,
+                           finish_check=attempt.finish_check)
 
     registry.register_agent_factory(factory, AGENT_NAME)
 
@@ -299,9 +350,10 @@ def make_agent_class() -> type:
         """Upstream's ``LLMAgent`` whose model call is made by bla's provider code."""
 
         def __init__(self, tools: list[Any], domain_policy: str, *, provider: str, model: str, api_key: str,
-                     send: Send, usage: AgentUsage):
+                     send: Send, usage: AgentUsage, finish_check: bool = False):
             super().__init__(tools=tools, domain_policy=domain_policy, llm=model, llm_args=None)
             self.provider, self.model, self.api_key, self.send, self.usage = provider, model, api_key, send, usage
+            self.finish_check = finish_check
 
         def _generate_next_message(self, message: Any, state: Any) -> Any:
             if isinstance(message, UserMessage) and message.is_audio:
@@ -314,6 +366,18 @@ def make_agent_class() -> type:
             self.usage.messages = state.messages
             items = _messages(state.messages)
             tools = tool_definitions(self.tools)
+            text, calls = self._ask(system, items, tools)
+            if self.finish_check:
+                held = check_note(items, text, calls, write_tool_names(self.tools), self.usage)
+                if held is not None:
+                    self.usage.checks.append(held[0])
+                    text, calls = self._ask(system, [*items, {"role": "user", "text": held[1]}], tools)
+            return AssistantMessage(
+                role="assistant", content=text or None,
+                tool_calls=[ToolCall(id=c["id"], name=c["name"], arguments=c["arguments"]) for c in calls] or None)
+
+        def _ask(self, system: str, items: list[dict[str, Any]], tools: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+            """One model call: its text and tool calls; its tokens are added to the attempt's usage."""
             started = time.perf_counter()
             if self.provider == "openai":
                 reply = self.send("openai", self.api_key, openai_request(self.model, system, items, tools))
@@ -340,9 +404,7 @@ def make_agent_class() -> type:
                 raise
             call.latency_seconds = time.perf_counter() - started
             self.usage.calls.append(call)
-            return AssistantMessage(
-                role="assistant", content=text or None,
-                tool_calls=[ToolCall(id=c["id"], name=c["name"], arguments=c["arguments"]) for c in calls] or None)
+            return text, calls
 
         def _note_unparsed(self, reply: dict[str, Any]) -> None:
             usage = reply.get("usage") or {}
