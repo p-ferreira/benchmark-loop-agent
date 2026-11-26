@@ -511,6 +511,9 @@ uv run --locked python -m benchmark_loop_agent.tau --output-dir runs/retail-haik
 uv run --locked python -m benchmark_loop_agent.tau --report runs/retail-haiku --rates rates-of-the-day.json
 ```
 
+With `--domain airline` the same command runs the 50 frozen English tasks of upstream's **airline** domain instead
+(see [The airline domain](#the-airline-domain)); without the option everything is retail, as before.
+
 ### What the retail part needs
 
 Upstream needs **Python 3.12** and more packages than the BFCL part (litellm, pandas, fastapi, ...). They are the
@@ -529,7 +532,8 @@ uv sync --locked --no-group tau --python 3.11   # BFCL only; the retail tests ar
   language `en`).
 * **Vendored, unmodified:** `vendor/tau2_bench/src/tau2` is a byte-for-byte copy of upstream's `src/tau2`, with upstream's
   `LICENSE`; `vendor/tau2_bench/data/tau2/` holds the data files the English retail text benchmark reads (the `text.json`
-  manifest, `retail_50.json`, the retail database, policy and tasks, the English language pack). Listed in `NOTICE`.
+  manifest, `retail_50.json` and `airline_50.json`, the retail and airline databases, policies and tasks, the English
+  language pack). Listed in `NOTICE`.
 * **Upstream's, used as it is:** the orchestrator, the retail environment and tools, the policy, the system-prompt
   template (`LLMAgent`), the simulated customer and its prompts, the language-pack persona of each task, the evaluator
   (database check and the two judges, at their defaults: the natural-language-assertions judge `gpt-5.4-mini-2026-03-17`
@@ -553,7 +557,8 @@ uv sync --locked --no-group tau --python 3.11   # BFCL only; the retail tests ar
 | `--openai-model ID`, `--anthropic-model ID` | the agent's model ID; otherwise `OPENAI_MODEL` / `ANTHROPIC_MODEL` |
 | `--trials N` | conversations per task (default 1) |
 | `--concurrency N` | conversations in flight at once (default 4) |
-| `--tasks ID ...` / `--limit N` | a partial run: these tasks of `retail_50`, or its first N. Not both. Without either, the run is exactly the 50 tasks |
+| `--domain retail\|airline` | the domain (default `retail`): its 50 tasks, tools and policy |
+| `--tasks ID ...` / `--limit N` | a partial run: these tasks of the domain's subset (`retail_50` or `airline_50`), or its first N. Not both. Without either, the run is exactly the 50 tasks |
 | `--user-model ID` | upstream's simulated customer's model (default `gpt-6-sol`), with upstream's reasoning setting for it (`reasoning_effort: low`). An id without a route is an OpenAI model |
 | `--instructions FILE` | UTF-8 text, 1 to 8,000 bytes, appended after upstream's policy text inside the policy part of the system prompt; nothing else changes |
 | `--seed S` | the seed the trial seeds are drawn from (default 300, as upstream) |
@@ -563,10 +568,10 @@ Keys are read from `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` at run time and writ
 scrubbed of them). The agent's provider key and `OPENAI_API_KEY` must both be set, or the command stops before any request
 (exit code 2). Exit code 0: every conversation scored; 3: some `unscored`.
 
-**The task set.** `retail_50.json` must hash to the digest written in `benchmark_loop_agent/tau/upstream.py` **and** to the
+**The task set.** The subset file (`retail_50.json`; for airline `airline_50.json`, `055b5d4f…8db`) must hash to the digest written in `benchmark_loop_agent/tau/upstream.py` **and** to the
 one upstream's manifest records for the subset (`dc7490f0…f2be`), and the 50 task identifiers are read from those very
 bytes; any other file is refused before any request. Upstream's own checks (its frozen-subset digest, that the canonical
-frame and the draw reproduce the subset) run as well. `--tasks` accepts only identifiers of `retail_50`.
+frame and the draw reproduce the subset) run as well. `--tasks` accepts only identifiers of the domain's subset. For airline the binding the manifest records (`fe3df4be…5ddc`) is checked too, as for retail.
 `run.json` records the upstream commit, the subset name and digest, the models, the trial count, the seed (and each
 trial's seed) and, with `--instructions`, the file's SHA-256 and byte length (the text is saved as `instructions.txt`).
 
@@ -633,7 +638,26 @@ of a kind for which its model has no rate, are reported as *not priced*, never a
 a figure that includes one is *not priced*. A component that used no tokens at all shows *none*; a figure over calls whose reply carried no usage says *at least* and
 how many calls are unknown.
 
-The retail tests (`tests/test_tau.py`) use scripted stand-ins for the agent's provider, the customer and the judges, and a
+### The airline domain
+
+`--domain airline` runs `airline_50` of the same pinned upstream (benchmark `text-v1`, language `en`): upstream's airline
+tools, policy, customer instructions and evaluator, and the same agent adapter. The data files are in
+`vendor/tau2_bench/data/tau2/`, byte for byte as at the pinned commit (listed in `NOTICE`): `domains/airline/{db.json,
+policy.md,tasks.json,split_tasks.json}` and `task_subsets/airline_50.json`; the English binding was already vendored.
+
+What differs for someone running the two domains:
+
+* **The tasks.** Airline tasks are numbered `0` to `49` as upstream numbers them, and `--tasks`/`--limit` select within `airline_50`.
+* **The score.** Upstream's airline reward is the database check and the communicate-information check (`DB` and
+  `COMMUNICATE` in `reward_components`); there is no natural-language-assertions judge. The communicate judge (`gpt-5.5`) is
+  called only for a task that lists information the agent must tell the customer, so many airline records show no judge call.
+* **The tools.** Airline has its own tool set (flights, reservations, baggage, `transfer_to_human_agents`), so the system prompt
+  and the tool definitions differ from retail's. For both, they are what upstream's standard agent sends.
+* **The records.** `run.json` records `upstream.domain`, `subset` and `benchmark` for the domain, and the report's title names
+  it. A directory holds one domain: running it again with another is refused like any other changed option. Directories
+  written before `--domain` existed are retail and are reported and resumed as before.
+
+The retail tests (`tests/test_tau.py`) and the airline tests (`tests/test_tau_airline.py`) use scripted stand-ins for the agent's provider, the customer and the judges, and a
 fixture of made-up rates; they need no key and no connection.
 
 ## Tests

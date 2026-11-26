@@ -20,7 +20,7 @@ EXIT_SOME_UNSCORED = 3  # argparse uses 2 for bad usage
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="benchmark_loop_agent.tau",
-        description="Run the 50 retail tasks of tau2-bench's text benchmark: an agent model called by bla, upstream's simulated "
+        description="Run the 50 retail (or airline) tasks of tau2-bench's text benchmark: an agent model called by bla, upstream's simulated "
                     "customer and tools, scored by upstream's evaluator. One record per conversation.")
     parser.add_argument("--output-dir", type=Path, help="where run.json, records.jsonl and conversations.jsonl go; "
                         "run again on the same directory to run what is missing or unscored")
@@ -29,9 +29,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--anthropic-model", help="Anthropic model ID of the agent (default: $ANTHROPIC_MODEL)")
     parser.add_argument("--trials", type=int, default=1, help="conversations per task (default: 1)")
     parser.add_argument("--concurrency", type=int, default=4, help="conversations in flight at once (default: 4)")
+    parser.add_argument("--domain", choices=sorted(upstream.DOMAINS), default=upstream.DOMAIN,
+                        help="the domain: its 50 frozen tasks, tools and policy (default: retail)")
     selection = parser.add_mutually_exclusive_group()
-    selection.add_argument("--tasks", nargs="+", metavar="ID", help="run only these tasks of retail_50 (a partial run)")
-    selection.add_argument("--limit", type=int, metavar="N", help="run only the first N tasks of retail_50 (a partial run)")
+    selection.add_argument("--tasks", nargs="+", metavar="ID", help="run only these tasks of the domain's subset (a partial run)")
+    selection.add_argument("--limit", type=int, metavar="N", help="run only the first N tasks of the domain's subset (a partial run)")
     parser.add_argument("--user-model", default="gpt-6-sol", help="model of upstream's simulated customer (default: gpt-6-sol)")
     parser.add_argument("--instructions", type=Path, metavar="FILE",
                         help="UTF-8 text file (1 to 8,000 bytes) appended to the policy part of the system prompt")
@@ -64,15 +66,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(f"no model for {args.provider}: give --{args.provider}-model or set {PROVIDERS[args.provider].model_env}")
     try:
         instruction = read_instruction(args.instructions) if args.instructions else None
-        ids = upstream.pinned_task_ids()  # the digest check, before any request
+        subset_name, _ = upstream.subset_of(args.domain)
+        ids = upstream.pinned_task_ids(domain=args.domain)  # the digest check, before any request
         if args.tasks is not None:
             unknown = [t for t in args.tasks if t not in ids]
             if unknown or len(set(args.tasks)) != len(args.tasks):
-                parser.error(f"--tasks must be distinct tasks of {upstream.SUBSET_NAME}; not accepted: {', '.join(unknown) or 'repeats'}")
+                parser.error(f"--tasks must be distinct tasks of {subset_name}; not accepted: {', '.join(unknown) or 'repeats'}")
             ids = list(args.tasks)
         elif args.limit is not None:
             ids = ids[:args.limit]
-        parameters = RunParameters(args.provider, model, args.user_model, tuple(ids), args.trials, args.seed, instruction, args.concurrency)
+        parameters = RunParameters(args.provider, model, args.user_model, tuple(ids), args.trials, args.seed, instruction, args.concurrency, args.domain)
         records = run_retail(args.output_dir, parameters, environment, send_request)
     except (ValueError, RuntimeError) as error:
         parser.error(str(error))
