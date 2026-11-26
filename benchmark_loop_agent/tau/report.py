@@ -128,7 +128,7 @@ def tokens_table(records: list[dict[str, Any]]) -> list[str]:
 def build_report(directory: Path, rates_path: Path = RATES_FILE) -> str:
     manifest = read_manifest(directory)
     if manifest is None:
-        raise ValueError(f"{directory / MANIFEST_FILE} not found: not a retail run directory")
+        raise ValueError(f"{directory / MANIFEST_FILE} not found: not a τ-bench run directory")
     parameters = manifest["parameters"]
     rates = load_rates(rates_path)
     agent_model, trials, task_ids = parameters["agent_model"], parameters["trials"], parameters["task_ids"]
@@ -138,8 +138,8 @@ def build_report(directory: Path, rates_path: Path = RATES_FILE) -> str:
     scored = [r for r in mine if r["outcome"] in SCORED]
     unscored = [r for r in mine if r["outcome"] not in SCORED]
     passed = [r for r in scored if r["outcome"] == "pass"]
-    out = [f"# τ-bench retail report: {parameters['provider']} `{agent_model}`", ""]
     upstream = parameters["upstream"]
+    out = [f"# τ-bench {upstream['domain']} report: {parameters['provider']} `{agent_model}`", ""]
     instructions = parameters.get("instructions")
     out += [f"- upstream: `{upstream['repository']}` {upstream['release']} (`{upstream['commit']}`), benchmark `{upstream['benchmark']}`, "
             f"language `{upstream['language']}`, subset `{parameters['subset']['name']}` (SHA-256 `{parameters['subset']['sha256']}`)",

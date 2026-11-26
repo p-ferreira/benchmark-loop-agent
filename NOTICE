@@ -31,8 +31,11 @@ MIT License (see vendor/tau2_bench/LICENSE), release v2.0.0, commit
   src/tau2/                                    -> vendor/tau2_bench/src/tau2/   (the whole package)
   LICENSE                                      -> vendor/tau2_bench/LICENSE
   data/tau2/benchmarks/text.json               -> vendor/tau2_bench/data/tau2/benchmarks/
-  data/tau2/task_subsets/retail_50.json        -> vendor/tau2_bench/data/tau2/task_subsets/
+  data/tau2/task_subsets/{retail_50,airline_50}.json
+                                               -> vendor/tau2_bench/data/tau2/task_subsets/
   data/tau2/domains/retail/{db.json,policy.md,tasks.json,split_tasks.json}
                                                -> vendor/tau2_bench/data/tau2/domains/retail/
+  data/tau2/domains/airline/{db.json,policy.md,tasks.json,split_tasks.json}
+                                               -> vendor/tau2_bench/data/tau2/domains/airline/
   data/tau2/multilingual/en/                   -> vendor/tau2_bench/data/tau2/multilingual/en/
-The other files of upstream (other domains' data, other languages, voice, tests, documentation) are not copied.
+The other files of upstream (the telecom domain's data, the airline voice files, other languages, voice, tests, documentation) are not copied.

@@ -30,7 +30,12 @@ RECORDS_FILE = "records.jsonl"
 CONVERSATIONS_FILE = "conversations.jsonl"
 MANIFEST_FILE = "run.json"
 INSTRUCTION_FILE = "instructions.txt"
-BENCHMARK = "tau2-bench retail (text, English)"
+BENCHMARK = "tau2-bench retail (text, English)"  # airline: the same wording with the domain named
+
+
+def benchmark_name(domain: str) -> str:
+    return BENCHMARK.replace("retail", domain)
+
 SCORED = ("pass", "fail")
 CUSTOMER_KEY_ENV = "OPENAI_API_KEY"  # the customer's default route and upstream's judges are OpenAI models
 
@@ -45,13 +50,15 @@ class RunParameters:
     seed: int = 300  # upstream's default seed
     instruction: str | None = None
     concurrency: int = 4
+    domain: str = upstream.DOMAIN
 
     def identity(self) -> dict[str, Any]:
         """Everything that decides which conversations a directory holds and how they were run."""
+        subset_name, subset_sha256 = upstream.subset_of(self.domain)
         return {
-            "benchmark": BENCHMARK,
-            "upstream": upstream.identity(),
-            "subset": {"name": upstream.SUBSET_NAME, "sha256": upstream.SUBSET_SHA256},
+            "benchmark": benchmark_name(self.domain),
+            "upstream": upstream.identity(self.domain),
+            "subset": {"name": subset_name, "sha256": subset_sha256},
             "task_ids": list(self.task_ids),
             "provider": self.provider,
             "agent_model": self.agent_model,
@@ -218,17 +225,18 @@ def run_retail(directory: Path, parameters: RunParameters, environment: Mapping[
                sleep: Callable[[float], Any] = time.sleep) -> list[dict[str, Any]]:
     """Run the conversations of ``parameters`` that are missing or unscored; return every record of the run."""
     check_environment(parameters, environment)
-    allowed = upstream.pinned_task_ids()  # the digest check: before the directory is touched and before any request
+    subset_name, _ = upstream.subset_of(parameters.domain)
+    allowed = upstream.pinned_task_ids(domain=parameters.domain)  # the digest check: before the directory is touched and before any request
     unknown = [t for t in parameters.task_ids if t not in allowed]
     if unknown or len(set(parameters.task_ids)) != len(parameters.task_ids):
-        raise ValueError(f"tasks outside {upstream.SUBSET_NAME} or repeated: {', '.join(unknown) or 'duplicates'}")
+        raise ValueError(f"tasks outside {subset_name} or repeated: {', '.join(unknown) or 'duplicates'}")
     identity = parameters.identity()
     previous = read_manifest(directory)
     if previous is not None and previous["parameters"] != identity:
         raise ValueError(f"{directory} holds a run with different options; use a new --output-dir or repeat the "
-                         "original provider, models, tasks, trials, concurrency, seed and instruction text")
+                         "original provider, domain, models, tasks, trials, concurrency, seed and instruction text")
     config, tasks = upstream.prepare(list(parameters.task_ids), parameters.agent_model, customer_model_route(parameters.user_model),
-                                     parameters.trials, parameters.seed)
+                                     parameters.trials, parameters.seed, domain=parameters.domain)
     store = Store(directory)
     if parameters.instruction is not None:
         (directory / INSTRUCTION_FILE).write_bytes(parameters.instruction.encode("utf-8"))
