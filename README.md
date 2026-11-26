@@ -13,7 +13,8 @@ Finished runs, with their records and reports, are in [`results/`](results/READM
 single-turn BFCL case on `gpt-6-sol` and `claude-opus-5-5`:
 [results/phase-0](results/phase-0/README.md).
 
-A second benchmark, [τ-bench retail](#τ-bench-retail), runs multi-turn conversations against upstream's simulated customer.
+A second benchmark, [τ-bench retail](#τ-bench-retail), runs multi-turn conversations against upstream's simulated customer. Its first
+runs, four models without an instruction, are in [results/phase-1/tau-retail](results/phase-1/tau-retail/README.md).
 
 ## Install
 
