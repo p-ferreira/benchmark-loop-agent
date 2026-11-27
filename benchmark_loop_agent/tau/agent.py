@@ -9,12 +9,14 @@ prompt caching and counts the tokens each reply reports, by kind.
 import contextvars
 import hashlib
 import json
+import re
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
 from ..providers import Send
+from . import rules as retail_rules
 from .upstream import AGENT_NAME, load
 
 AGENT_MAX_TOKENS = 8192  # the Messages API requires a limit; a retail turn is a short message or a tool call
@@ -57,6 +59,10 @@ class AgentUsage:
     messages: list[Any] = field(default_factory=list)  # the agent's view of the conversation so far, for a failed attempt
     checks: list[str] = field(default_factory=list)  # with ``--finish-check``: each time a reply was held and asked again, which check
     writes_checked: int = 0  # write calls of the conversation already covered by a requests check
+    handover_offered: bool = False  # with ``--handover-rule``: the customer asked for a person, so the transfer tool was offered
+    handover_refusals: int = 0  # with ``--handover-rule``: replies that announced a transfer without the tool and were asked again
+    handover_announced: int = 0  # with ``--handover-rule``: replies that still announced one after the asks, and went to the customer
+    rules: Any = field(default_factory=retail_rules.RuleState)  # with ``--rules``: holds, the agent's own searches, corrections
 
     def totals(self) -> dict[str, int]:
         return {kind: sum(getattr(call, kind) for call in self.calls) for kind in TOKEN_KINDS}
@@ -234,6 +240,8 @@ class Attempt:
     usage: AgentUsage
     instruction: str | None = None
     finish_check: bool = False
+    handover_rule: bool = False
+    rules: tuple[str, ...] = ()
 
 
 _attempt: contextvars.ContextVar[Attempt | None] = contextvars.ContextVar("tau_attempt", default=None)
@@ -307,6 +315,54 @@ def check_note(items: list[dict[str, Any]], text: str, calls: list[dict[str, Any
     return REQUESTS, REQUESTS_NOTE.format(held=json.dumps(text, ensure_ascii=False))
 
 
+# --- the hand-over rule (``--handover-rule``) -----------------------------------------------
+#
+# Off by default. With it, the transfer tool is not among the tools sent to the model until the
+# customer has asked for a person, in the customer's own words. Until then the model can decline
+# or carry on, but it cannot hand the conversation over. The rule reads the customer's messages
+# and nothing else: no task, no expected action, no score.
+
+ASKS_FOR_A_PERSON = re.compile(
+    r"\b(human|representative|supervisor|manager|specialist|higher[- ]up|escalat\w*|"
+    r"(a|an|another|real|live|actual) (person|agent)|(some|any)(one|body) (else|who|that)|have (some|any)(one|body)|"
+    r"another (team|department)|different (agent|team|department|person)|"
+    r"(connect|transfer|put|pass|hand) me\b|(speak|talk) (to|with) (some|any)(one|body))\b",
+    re.IGNORECASE)
+# "I don't want a supervisor" does not ask for one: a match that follows one of these, in the same sentence, is not counted.
+DECLINES_A_PERSON = re.compile(r"\b(don'?t|do not|didn'?t|did not|no need|not asking|never|without|rather not|won'?t)\b[^.?!]{0,40}$", re.IGNORECASE)
+# What the customer takes as being transferred: the policy's sentence, and other ways of saying it.
+ANNOUNCES_TRANSFER = re.compile(
+    r"\b(being transferred to|transferr(ed|ing) you|(transfer|connect|hand|pass|put)(ing)? you (now )?(to|with|over|off|through)|"
+    r"(escalat(e|ed|ing)|forward(ed|ing)?) (this|your|you))\b", re.IGNORECASE)
+# "I can't transfer you" announces nothing: a match that follows one of these, in the same sentence, is not counted.
+DENIES_TRANSFER = re.compile(r"\b(can'?t|cannot|can not|unable|not able|won'?t|will not|don'?t|do not|no way|not possible|isn'?t|is not)\b[^.?!]{0,40}$",
+                             re.IGNORECASE)
+HANDOVER_REASKS = 2
+HANDOVER_REFUSAL = (
+    CHECK_HEADER + " A transfer to a human agent is not available at this point of the conversation: the customer has "
+    "not asked for a person. Do not announce or promise a transfer. Tell the customer what you can and cannot do under "
+    "the policy, and continue with what you can do.")
+
+
+def customer_asked_for_a_person(items: list[dict[str, Any]]) -> bool:
+    """Whether a message of the customer, so far, asks for a person (and does not say it wants none)."""
+    for item in items:
+        if item["role"] != "user":
+            continue
+        for match in ASKS_FOR_A_PERSON.finditer(item["text"]):
+            if not DECLINES_A_PERSON.search(item["text"][:match.start()]):
+                return True
+    return False
+
+
+def announces_handover(text: str, calls: list[dict[str, Any]]) -> bool:
+    """Whether the reply hands the customer over: a call to the transfer tool, or words that say a transfer is happening."""
+    if any(call["name"] == HANDOVER_TOOL for call in calls):
+        return True
+    text = text or ""
+    return any(not DENIES_TRANSFER.search(text[:match.start()]) for match in ANNOUNCES_TRANSFER.finditer(text))
+
+
 def policy_with_instruction(policy: str, instruction: str | None) -> str:
     """Upstream's policy; with ``--instructions``, the file's text after it, in the policy part."""
     return policy if instruction is None else f"{policy}\n\n{instruction}"
@@ -333,7 +389,8 @@ def _register_agent() -> None:
             raise RuntimeError("bla's agent is built only inside an attempt")
         return agent_class(tools, policy_with_instruction(domain_policy, attempt.instruction), provider=attempt.provider,
                            model=attempt.model, api_key=attempt.api_key, send=attempt.send, usage=attempt.usage,
-                           finish_check=attempt.finish_check)
+                           finish_check=attempt.finish_check, handover_rule=attempt.handover_rule,
+                           rules=attempt.rules)
 
     registry.register_agent_factory(factory, AGENT_NAME)
 
@@ -350,10 +407,11 @@ def make_agent_class() -> type:
         """Upstream's ``LLMAgent`` whose model call is made by bla's provider code."""
 
         def __init__(self, tools: list[Any], domain_policy: str, *, provider: str, model: str, api_key: str,
-                     send: Send, usage: AgentUsage, finish_check: bool = False):
+                     send: Send, usage: AgentUsage, finish_check: bool = False, handover_rule: bool = False,
+                     rules: tuple[str, ...] = ()):
             super().__init__(tools=tools, domain_policy=domain_policy, llm=model, llm_args=None)
             self.provider, self.model, self.api_key, self.send, self.usage = provider, model, api_key, send, usage
-            self.finish_check = finish_check
+            self.finish_check, self.handover_rule, self.rules = finish_check, handover_rule, rules
 
         def _generate_next_message(self, message: Any, state: Any) -> Any:
             if isinstance(message, UserMessage) and message.is_audio:
@@ -365,8 +423,35 @@ def make_agent_class() -> type:
             system = state.system_messages[0].content  # upstream keeps exactly one: the system prompt
             self.usage.messages = state.messages
             items = _messages(state.messages)
+            if self.rules:  # ``--rules``: the turn is run by the rules (searches of the agent's own, holds, corrections)
+                try:
+                    text, calls = retail_rules.turn(self.rules, items, tool_definitions(self.tools),
+                                                    lambda shown, tools: self._ask(system, shown, tools), self.usage.rules,
+                                                    customer_asked_for_a_person(items))
+                except retail_rules.RuleError as error:
+                    raise AgentCallError(str(error)) from None
+                return AssistantMessage(
+                    role="assistant", content=text or None,
+                    tool_calls=[ToolCall(id=c["id"], name=c["name"], arguments=c["arguments"]) for c in calls] or None)
             tools = tool_definitions(self.tools)
+            withheld = False
+            if self.handover_rule:
+                if customer_asked_for_a_person(items):
+                    self.usage.handover_offered = True
+                else:
+                    tools = [tool for tool in tools if tool["function"]["name"] != HANDOVER_TOOL]
+                    withheld = True
             text, calls = self._ask(system, items, tools)
+            if withheld:
+                for _ in range(HANDOVER_REASKS):
+                    if not announces_handover(text, calls):
+                        break
+                    self.usage.handover_refusals += 1
+                    text, calls = self._ask(system, [*items, {"role": "user", "text": HANDOVER_REFUSAL}], tools)
+                if any(call["name"] == HANDOVER_TOOL for call in calls):
+                    raise AgentCallError("the model called the transfer tool, which was not among the tools it was sent")
+                if announces_handover(text, calls):
+                    self.usage.handover_announced += 1  # the customer will read a transfer that the tools never made
             if self.finish_check:
                 held = check_note(items, text, calls, write_tool_names(self.tools), self.usage)
                 if held is not None:

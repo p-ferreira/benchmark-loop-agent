@@ -46,12 +46,21 @@ class RunParameters:
     instruction: str | None = None
     concurrency: int = 4
     finish_check: bool = False
+    handover_rule: bool = False
+    rules: tuple[str, ...] = ()
+    unseen: bool = False  # the tasks are those of upstream's base split outside the pinned subset
 
     def identity(self) -> dict[str, Any]:
         """Everything that decides which conversations a directory holds and how they were run."""
         identity = self._identity()
         if self.finish_check:  # written only when on, so that a run without it records what it always did
             identity["finish_check"] = True
+        if self.handover_rule:
+            identity["handover_rule"] = True
+        if self.rules:
+            identity["rules"] = sorted(self.rules)
+        if self.unseen:
+            identity["task_set"] = "base split outside the subset"
         return identity
 
     def _identity(self) -> dict[str, Any]:
@@ -226,6 +235,8 @@ def run_retail(directory: Path, parameters: RunParameters, environment: Mapping[
     """Run the conversations of ``parameters`` that are missing or unscored; return every record of the run."""
     check_environment(parameters, environment)
     allowed = upstream.pinned_task_ids()  # the digest check: before the directory is touched and before any request
+    if parameters.unseen:
+        allowed = upstream.unseen_task_ids()
     unknown = [t for t in parameters.task_ids if t not in allowed]
     if unknown or len(set(parameters.task_ids)) != len(parameters.task_ids):
         raise ValueError(f"tasks outside {upstream.SUBSET_NAME} or repeated: {', '.join(unknown) or 'duplicates'}")
@@ -233,7 +244,7 @@ def run_retail(directory: Path, parameters: RunParameters, environment: Mapping[
     previous = read_manifest(directory)
     if previous is not None and previous["parameters"] != identity:
         raise ValueError(f"{directory} holds a run with different options; use a new --output-dir or repeat the "
-                         "original provider, models, tasks, trials, concurrency, seed, instruction text and finish check")
+                         "original provider, models, tasks, trials, concurrency, seed, instruction text, finish check and hand-over rule")
     config, tasks = upstream.prepare(list(parameters.task_ids), parameters.agent_model, customer_model_route(parameters.user_model),
                                      parameters.trials, parameters.seed)
     store = Store(directory)
@@ -241,7 +252,8 @@ def run_retail(directory: Path, parameters: RunParameters, environment: Mapping[
         (directory / INSTRUCTION_FILE).write_bytes(parameters.instruction.encode("utf-8"))
     pending = store.pending(parameters.task_ids, parameters.trials)
     seeds = trial_seeds(parameters.seed, parameters.trials)
-    settings = Settings(parameters.provider, parameters.agent_model, parameters.user_model, parameters.instruction, parameters.finish_check)
+    settings = Settings(parameters.provider, parameters.agent_model, parameters.user_model, parameters.instruction, parameters.finish_check,
+                        parameters.handover_rule, tuple(parameters.rules))
 
     number = len(previous["sessions"]) + 1 if previous else 1
     run_id = (previous or {}).get("run_id") or uuid.uuid4().hex

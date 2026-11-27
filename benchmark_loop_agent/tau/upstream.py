@@ -67,6 +67,18 @@ def pinned_task_ids(root: Path | None = None) -> list[str]:
     return ids
 
 
+def unseen_task_ids(root: Path | None = None) -> list[str]:
+    """The retail tasks of upstream's ``base`` split that are not in ``retail_50``, in upstream's order: identifiers only."""
+    pinned = set(pinned_task_ids(root))
+    try:
+        base = json.loads(((root or VENDOR_ROOT) / "data" / "tau2" / "domains" / DOMAIN / "split_tasks.json").read_text())["base"]
+    except (OSError, ValueError, KeyError) as error:
+        raise TaskSetError(f"cannot read upstream's retail splits: {error}") from None
+    if not (isinstance(base, list) and all(isinstance(i, str) for i in base) and pinned <= set(base) and len(set(base)) == len(base)):
+        raise TaskSetError("upstream's base split does not hold the pinned subset")
+    return [i for i in base if i not in pinned]
+
+
 _loaded: SimpleNamespace | None = None
 
 

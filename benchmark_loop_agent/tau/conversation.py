@@ -29,6 +29,8 @@ class Settings:
     user_model: str
     instruction: str | None = None
     finish_check: bool = False
+    handover_rule: bool = False
+    rules: tuple[str, ...] = ()
     max_steps: int = 200  # upstream's defaults
     max_errors: int = 10
 
@@ -47,7 +49,7 @@ def run_attempt(config: Any, task: Any, seed: int, settings: Settings, environme
                                "reason": None}
     simulation = None
     attempt = Attempt(settings.provider, settings.agent_model, environment.get(PROVIDERS[settings.provider].key_env, ""), send,
-                      usage, settings.instruction, settings.finish_check)
+                      usage, settings.instruction, settings.finish_check, settings.handover_rule, settings.rules)
     try:
         upstream = load()
         register_agent()
@@ -88,6 +90,11 @@ def run_attempt(config: Any, task: Any, seed: int, settings: Settings, environme
     }
     if settings.finish_check:
         fields["agent_checks"] = list(usage.checks)  # each reply that was held and asked again, by check
+    if settings.handover_rule:  # whether the transfer tool was ever offered, and replies asked again for announcing one without it
+        fields["agent_handover"] = {"offered": usage.handover_offered, "refused_replies": usage.handover_refusals,
+                                    "announced_without_tool": usage.handover_announced}
+    if settings.rules:  # each reply held and asked again, by rule; the agent's own searches; address calls corrected
+        fields["agent_rules"] = usage.rules.record()
     conversation = {"messages": _messages(simulation, usage), "partial": partial, "reward_info": _reward_info(simulation),
                     "agent_call_usage": [call.to_dict() for call in usage.calls]}
     return {"fields": redact(fields, secrets), "conversation": redact(conversation, secrets)}

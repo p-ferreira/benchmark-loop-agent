@@ -1,0 +1,15 @@
+4 runs of gpt-6-luna, 4 trials of 50 tasks each
+other tasks: fail                  14    of those, made with as many changes as the task expects
+other tasks: fail                  30    of those, made with fewer changes than the task expects
+other tasks: fail                  95  conversations
+other tasks: fail                   4  transfer the rule would allow
+other tasks: fail                  44  transfer the rule would not allow
+other tasks: pass                  65    of those, made with as many changes as the task expects
+other tasks: pass                 657  conversations
+other tasks: pass                  23  transfer the rule would allow
+other tasks: pass                  65  transfer the rule would not allow
+tasks 38, 52, 105: fail             3    of those, made with as many changes as the task expects
+tasks 38, 52, 105: fail            16    of those, made with fewer changes than the task expects
+tasks 38, 52, 105: fail            48  conversations
+tasks 38, 52, 105: fail            12  transfer the rule would allow
+tasks 38, 52, 105: fail            19  transfer the rule would not allow

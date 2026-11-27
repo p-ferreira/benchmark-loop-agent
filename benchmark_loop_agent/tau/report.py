@@ -147,9 +147,20 @@ def build_report(directory: Path, rates_path: Path = RATES_FILE) -> str:
             f"`{parameters['customer_reasoning']['reasoning_effort']}`; judges: upstream's defaults",
             f"- trials {trials}, seed {parameters['seed']}",
             "- instructions: " + (f"SHA-256 `{instructions['sha256']}`, {instructions['bytes']} bytes" if instructions else "none (upstream's policy only)"),
+            *(["- task set: the retail tasks of upstream's base split outside the pinned subset"] if parameters.get("task_set") else []),
             *(["- finish check: on (a reply is held once and asked again before a hand-over to a human, and before the reply "
                f"after a change); replies held: {sum(len(r.get('agent_checks') or []) for r in mine)}"]
               if parameters.get("finish_check") else []),
+            *(["- hand-over rule: on (the transfer tool is sent to the model only after the customer asks for a person); "
+               f"conversations where it was offered: {sum(1 for r in mine if (r.get('agent_handover') or {}).get('offered'))}; "
+               f"replies asked again for announcing a transfer without it: {sum((r.get('agent_handover') or {}).get('refused_replies', 0) for r in mine)}; "
+               f"announcements that reached the customer anyway: {sum((r.get('agent_handover') or {}).get('announced_without_tool', 0) for r in mine)}"]
+              if parameters.get("handover_rule") else []),
+            *([f"- rules in code: {', '.join(parameters['rules'])}; replies held and asked again: "
+               + (", ".join(f"{name} {sum((r.get('agent_rules') or {}).get('holds', []).count(name) for r in mine)}" for name in ("handover-once", "unsearched", "same-item", "order-lock", "payment", "state")))
+               + f"; searches run in code: {sum(len((r.get('agent_rules') or {}).get('searches', [])) for r in mine)}"
+               + f"; address calls corrected: {sum((r.get('agent_rules') or {}).get('address_corrections', 0) for r in mine)}"]
+              if parameters.get("rules") else []),
             "", "## Conversations", "",
             f"- tasks: {len(task_ids)}; trials: {trials}; conversations asked for: {len(wanted)}",
             f"- scored: {len(scored)}; unscored: {len(unscored)}; no record yet: {len(wanted) - len(mine)}", ""]

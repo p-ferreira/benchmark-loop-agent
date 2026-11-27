@@ -12,6 +12,7 @@ from ..runner import PROVIDERS
 from . import upstream
 from .batch import RunParameters, run_retail
 from .report import RATES_FILE, build_report
+from .rules import RULES
 
 EXIT_DONE = 0
 EXIT_SOME_UNSCORED = 3  # argparse uses 2 for bad usage
@@ -38,6 +39,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--finish-check", action="store_true",
                         help="hold a reply once and ask the agent again before it hands the customer to a human, and before its "
                              "reply after a call that changed something (off by default)")
+    parser.add_argument("--handover-rule", action="store_true",
+                        help="do not send the model the transfer tool until the customer has asked for a person (off by default)")
+    parser.add_argument("--rules", metavar="NAMES", default="",
+                        help="retail rules in code, comma-separated: " + ", ".join(RULES) + " (off by default; see tau/rules.py)")
+    parser.add_argument("--unseen", action="store_true",
+                        help="run the retail tasks of upstream's base split that are not in the pinned subset (64 tasks)")
     parser.add_argument("--seed", type=int, default=300, help="seed of the trial seeds, as upstream's runner (default: 300)")
     parser.add_argument("--report", type=Path, metavar="DIR", help="write the report of a finished or partial run directory and stop")
     parser.add_argument("--rates", type=Path, default=RATES_FILE, metavar="FILE",
@@ -48,6 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    chosen_rules = tuple(name.strip() for name in args.rules.split(",") if name.strip())
+    if set(chosen_rules) - set(RULES) or len(set(chosen_rules)) != len(chosen_rules):
+        parser.error(f"--rules takes distinct names among: {', '.join(RULES)}")
+    if chosen_rules and (args.finish_check or args.handover_rule):
+        parser.error("--rules cannot be combined with --finish-check or --handover-rule")
     if args.report is not None:
         try:
             print(build_report(args.report, args.rates), end="")
@@ -68,6 +80,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         instruction = read_instruction(args.instructions) if args.instructions else None
         ids = upstream.pinned_task_ids()  # the digest check, before any request
+        if args.unseen:
+            ids = upstream.unseen_task_ids()
         if args.tasks is not None:
             unknown = [t for t in args.tasks if t not in ids]
             if unknown or len(set(args.tasks)) != len(args.tasks):
@@ -75,7 +89,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ids = list(args.tasks)
         elif args.limit is not None:
             ids = ids[:args.limit]
-        parameters = RunParameters(args.provider, model, args.user_model, tuple(ids), args.trials, args.seed, instruction, args.concurrency, args.finish_check)
+        parameters = RunParameters(args.provider, model, args.user_model, tuple(ids), args.trials, args.seed, instruction, args.concurrency, args.finish_check, args.handover_rule, chosen_rules, args.unseen)
         records = run_retail(args.output_dir, parameters, environment, send_request)
     except (ValueError, RuntimeError) as error:
         parser.error(str(error))
