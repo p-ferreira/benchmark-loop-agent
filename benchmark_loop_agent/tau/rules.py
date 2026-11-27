@@ -8,14 +8,16 @@ they can be run on recorded conversations.
 ``offers``        the model no longer reads a product's variants itself. ``get_product_details`` is shown as a
                   summary without the variants, and a tool of the agent's own, ``find_replacement_items``, searches
                   them in code: availability, the options the customer requires, prices and price differences,
-                  cheapest first. A change or exchange to an item that no search returned is held.
+                  cheapest first. A change or exchange to an item that no search returned, or of an item for itself,
+                  is held.
 ``order-lock``    an item change of a pending order is held once when the customer spoke of a delivery address and
                   that order's address was not changed: the item change locks the order.
 ``payment``       an item change or exchange is held once when the customer has several payment methods on file and
                   has named none: the model is told to ask which one takes the price difference.
-``address``       address fields of a write call are put in the database's forms ("USA", two-letter state).
-``handover-once`` the first transfer of a conversation, made before the customer asked for a person, is refused
-                  once: the model must say what it cannot do and ask whether there is anything else.
+``address``       address fields of a write call are put in the database's forms ("USA", two-letter state); a reply that
+                  asks the customer for the state or country is held once with the state looked up from the ZIP code.
+``handover-once`` the first transfer made before the customer asked for a person is refused, once in a conversation:
+                  the model must say what it cannot do and ask whether there is anything else.
 """
 
 import json
@@ -200,11 +202,13 @@ def search(items: Items, arguments: dict[str, Any]) -> str:
     def misses(variant: dict[str, Any]) -> dict[str, Any]:
         return {name: variant["options"].get(name) for name, value in wanted.items() if _norm(variant["options"].get(name)) != value}
 
-    in_stock = [v for v in pool if v.get("available")]
+    in_stock = [v for v in pool if v.get("available") and (current is None or v.get("item_id") != current.get("item_id"))]
     matches = sorted((v for v in in_stock if not misses(v)), key=lambda v: (v["price"], v["item_id"]))
     result: dict[str, Any] = {"product": product.get("name"), "product_id": product_id, "searched_for": wanted or "any item in stock"}
     if current is not None:
-        result["current_item"] = {"item_id": current["item_id"], "options": current["options"], "price_paid": old}
+        result["current_item"] = {"item_id": current["item_id"], "options": current["options"], "price_paid": old,
+                                  "note": "Not among the items below: an item cannot be changed or exchanged for itself. A replacement "
+                                          "must be a different item of the product."}
     if among is not None:
         result["only_among_item_ids"] = sorted(among)
         result["of_those_not_variants_of_this_product"] = sorted(among - {v.get("item_id") for v in variants})
@@ -212,6 +216,8 @@ def search(items: Items, arguments: dict[str, Any]) -> str:
     if matches:
         cheapest = [v["item_id"] for v in matches if v["price"] == matches[0]["price"]]
         result["cheapest_match"] = cheapest[0] if len(cheapest) == 1 else {"tie_at_the_same_price": cheapest}
+        if old is not None:  # for "the cheapest one": the item the customer has may already be it
+            result["keeping_the_current_item_is_cheaper_than_every_match"] = round(old * 100) < round(float(matches[0]["price"]) * 100)
     else:
         result["no_item_in_stock_matches"] = True
         result["matching_items_out_of_stock"] = [v["item_id"] for v in pool if not v.get("available") and not misses(v)]
@@ -246,6 +252,25 @@ def unsearched_change(items: Items, calls: Calls) -> str | None:
         missing = [str(item) for item in new if str(item) not in offered]
         if missing:
             return UNSEARCHED_NOTE.format(held=_held(call), missing=", ".join(missing))
+    return None
+
+
+SAME_ITEM_NOTE = (
+    HEADER + " You were about to make this call: {held}\n"
+    "It replaces item {same} with itself. The policy allows a change or an exchange only to a different item of the same "
+    "product, so this call is refused. Tell the customer that the item cannot be replaced by the same item, and ask "
+    "whether they want a different option of it or something else.")
+SAME_ITEM_HOLDS = 2
+
+
+def same_item_change(calls: Calls) -> str | None:
+    """The note, when this reply changes or exchanges an item for itself."""
+    for call in calls:
+        old, new = call["arguments"].get("item_ids"), call["arguments"].get("new_item_ids")
+        if call["name"] in ITEM_CHANGES and isinstance(old, list) and isinstance(new, list):
+            same = [str(a) for a, b in zip(old, new) if str(a) == str(b)]
+            if same:
+                return SAME_ITEM_NOTE.format(held=_held(call), same=", ".join(same))
     return None
 
 
@@ -322,6 +347,43 @@ STATES = {
 }
 
 
+# The first three digits of a ZIP code give the state. 201 is left out: the store's addresses use it for Washington, DC.
+ZIP_STATES = (
+    (5, 5, "NY"), (10, 27, "MA"), (28, 29, "RI"), (30, 38, "NH"), (39, 49, "ME"), (50, 59, "VT"), (60, 69, "CT"), (70, 89, "NJ"),
+    (100, 149, "NY"), (150, 196, "PA"), (197, 199, "DE"), (200, 200, "DC"), (202, 205, "DC"), (206, 219, "MD"), (220, 246, "VA"),
+    (247, 268, "WV"), (270, 289, "NC"), (290, 299, "SC"), (300, 319, "GA"), (320, 349, "FL"), (350, 369, "AL"), (370, 385, "TN"),
+    (386, 397, "MS"), (398, 399, "GA"), (400, 427, "KY"), (430, 459, "OH"), (460, 479, "IN"), (480, 499, "MI"), (500, 528, "IA"),
+    (530, 549, "WI"), (550, 567, "MN"), (570, 577, "SD"), (580, 588, "ND"), (590, 599, "MT"), (600, 629, "IL"), (630, 658, "MO"),
+    (660, 679, "KS"), (680, 693, "NE"), (700, 714, "LA"), (716, 729, "AR"), (730, 749, "OK"), (750, 799, "TX"), (800, 816, "CO"),
+    (820, 831, "WY"), (832, 838, "ID"), (840, 847, "UT"), (850, 865, "AZ"), (870, 884, "NM"), (885, 885, "TX"), (889, 898, "NV"),
+    (900, 961, "CA"), (967, 968, "HI"), (970, 979, "OR"), (980, 994, "WA"), (995, 999, "AK"))
+ZIP = re.compile(r"(?<![\d#])\d{5}(?!\d)")
+ASKS_STATE_OR_COUNTRY = re.compile(r"\b(state|country)\b", re.IGNORECASE)
+STATE_NOTE = (
+    HEADER + " You were about to send this reply: {held}\n"
+    "The system has looked up what you were about to ask for. {facts} The country of every address in this store is USA. "
+    "These are looked-up facts, not guesses: use them, do not ask the customer for the state or the country, and go on "
+    "with the address the customer gave (summarise it in full and ask for their confirmation as the policy requires).")
+
+
+def state_for_zip(code: str) -> str | None:
+    """The two-letter state of a five-digit ZIP code; ``None`` when the prefix is not in the table."""
+    if not (isinstance(code, str) and len(code.strip()) == 5 and code.strip().isdigit()):
+        return None
+    prefix = int(code.strip()[:3])
+    return next((state for low, high, state in ZIP_STATES if low <= prefix <= high), None)
+
+
+def asks_state_or_country(items: Items, text: str, calls: Calls) -> str | None:
+    """The note, when a reply about an address asks for the state or country and a ZIP code the customer gave settles the state."""
+    if calls or not text or not ASKS_STATE_OR_COUNTRY.search(text) or "address" not in text.lower() or re.search(r"\bUSA\b", text):
+        return None
+    codes = [code for item in items if item["role"] == "user" for code in ZIP.findall(item["text"])]
+    states = {code: state_for_zip(code) for code in dict.fromkeys(codes)}
+    facts = [f"ZIP code {code} is in the state {state}." for code, state in states.items() if state]
+    return STATE_NOTE.format(held=json.dumps(text, ensure_ascii=False), facts=" ".join(facts)) if facts else None
+
+
 def fix_address(call: dict[str, Any]) -> dict[str, Any]:
     """The call with its country and state in the database's forms; the same object when nothing changes."""
     if call["name"] not in ADDRESS_TOOLS:
@@ -335,6 +397,8 @@ def fix_address(call: dict[str, Any]) -> dict[str, Any]:
             arguments["state"] = STATES[state.strip().lower()]
         elif len(state.strip()) == 2 and state != state.strip().upper():
             arguments["state"] = state.strip().upper()
+        elif not state.strip() and state_for_zip(arguments.get("zip")):
+            arguments["state"] = state_for_zip(arguments.get("zip"))
     return call if arguments == call["arguments"] else {**call, "arguments": arguments}
 
 
@@ -348,8 +412,11 @@ HANDOVER_ONCE_NOTE = (
     "anything else you can help with. If the customer then still needs something outside your tools, you can transfer.")
 
 
+HANDOVER_REFUSALS = 1  # a second refusal can keep a customer from help the policy requires (Codex, on the full run)
+
+
 def first_early_transfer(items: Items, calls: Calls, asked_for_a_person: bool) -> bool:
-    """This reply makes the conversation's first transfer, and the customer has not asked for a person."""
+    """This reply transfers, no transfer was made before, and the customer has not asked for a person."""
     if asked_for_a_person or not any(call["name"] == HANDOVER_TOOL for call in calls):
         return False
     return not any(call["name"] == HANDOVER_TOOL for item in items if item["role"] == "assistant" for call in item["calls"])
@@ -391,8 +458,13 @@ def with_local(base: Items, state: RuleState) -> Items:
 
 def _hold(rules: tuple[str, ...], items: Items, calls: Calls, state: RuleState, asked_for_a_person: bool) -> tuple[str, str] | None:
     """Which rule holds this reply, and its note: one at a time, each kind a limited number of times in a conversation."""
-    if "handover-once" in rules and "handover-once" not in state.holds and first_early_transfer(items, calls, asked_for_a_person):
+    if ("handover-once" in rules and state.holds.count("handover-once") < HANDOVER_REFUSALS
+            and first_early_transfer(items, calls, asked_for_a_person)):
         return "handover-once", HANDOVER_ONCE_NOTE
+    if "offers" in rules and state.holds.count("same-item") < SAME_ITEM_HOLDS:
+        note = same_item_change(calls)
+        if note:
+            return "same-item", note
     if "offers" in rules and state.holds.count("unsearched") < UNSEARCHED_HOLDS:
         note = unsearched_change(items, calls)
         if note:
@@ -405,6 +477,15 @@ def _hold(rules: tuple[str, ...], items: Items, calls: Calls, state: RuleState, 
         note = payment_not_chosen(items, calls)
         if note:
             return "payment", note
+    return None
+
+
+def _text_hold(rules: tuple[str, ...], items: Items, text: str, calls: Calls, state: RuleState) -> tuple[str, str] | None:
+    """A hold that reads the reply's words: the question about the state or country, once in a conversation."""
+    if "address" in rules and "state" not in state.holds:
+        note = asks_state_or_country(items, text, calls)
+        if note:
+            return "state", note
     return None
 
 
@@ -432,7 +513,7 @@ def turn(rules: tuple[str, ...], base: Items, tools: list[dict[str, Any]], ask: 
             items = items + entry
             text, calls = ask(shown(), tools)
             continue
-        held = _hold(rules, items, calls, state, asked_for_a_person)
+        held = _hold(rules, items, calls, state, asked_for_a_person) or _text_hold(rules, items, text, calls, state)
         if held is None:
             break
         state.holds.append(held[0])

@@ -1250,6 +1250,43 @@ class RetailRulesTests(Base):
         tau_rules.turn(("order-lock", "payment"), items, [], ask, state, False)
         self.assertEqual(len(asked), 1)  # neither is asked a second time in the conversation
 
+    def test_an_item_is_no_replacement_for_itself_in_the_search_or_in_a_change(self):
+        found = self.search(current_item_id="2", required_options={"color": "black"})
+        self.assertEqual([row["item_id"] for row in found["items_in_stock_that_match_cheapest_first"]], ["5"])  # item 2 itself is left out
+        self.assertIn("cannot be changed or exchanged for itself", found["current_item"]["note"])
+        self.assertIs(found["keeping_the_current_item_is_cheaper_than_every_match"], True)  # 7.25 paid against 12.00
+        self.assertIs(self.search(current_item_id="1", required_options={"color": "black"})["keeping_the_current_item_is_cheaper_than_every_match"], False)
+        only_itself = self.search(current_item_id="2", required_options={"color": "black", "size": "S"})
+        self.assertIs(only_itself["no_item_in_stock_matches"], True)
+        same = [call("exchange_delivered_order_items", order_id="#W1", item_ids=["2", "3"], new_item_ids=["2", "4"], payment_method_id="p")]
+        self.assertIn("replaces item 2 with itself", tau_rules.same_item_change(same))
+        self.assertIsNone(tau_rules.same_item_change([call("exchange_delivered_order_items", order_id="#W1", item_ids=["2"], new_item_ids=["5"])]))
+        self.assertIsNone(tau_rules.same_item_change([call("return_delivered_order_items", order_id="#W1", item_ids=["2"])]))
+        state = tau_rules.RuleState()
+        ask, asked = self.scripted([("", same), ("That item cannot be exchanged for itself. Another option?", [])])
+        self.assertEqual(tau_rules.turn(("offers",), self.ITEMS, [], ask, state, False)[1], [])
+        self.assertEqual(state.holds, ["same-item"])
+
+    def test_the_state_is_looked_up_from_the_zip_code_and_a_reply_asking_for_it_is_held_once(self):
+        self.assertEqual([tau_rules.state_for_zip(code) for code in ("10001", "80280", "62701", "20307", "20156", "1000", "abcde", None)],
+                         ["NY", "CO", "IL", "DC", None, None, None, None])
+        gave = [{"role": "user", "text": "Change order #W9911714 to 101 Highway, New York, 10001."}]
+        asking = "I still need the state and country before I can prepare the address update."
+        note = tau_rules.asks_state_or_country(gave, asking, [])
+        self.assertIn("ZIP code 10001 is in the state NY.", note)
+        self.assertNotIn("99117", note)  # digits of an order number are not a ZIP code
+        self.assertIsNone(tau_rules.asks_state_or_country(gave, "New address: 101 Highway, New York, NY 10001, USA. Confirm?", []))
+        self.assertIsNone(tau_rules.asks_state_or_country(gave, "Which order would you like to change?", []))
+        self.assertIsNone(tau_rules.asks_state_or_country([{"role": "user", "text": "Change my address please."}], asking, []))  # no ZIP code given
+        self.assertIsNone(tau_rules.asks_state_or_country(gave, asking, [call("get_user_details", user_id="u")]))
+        state = tau_rules.RuleState()
+        ask, asked = self.scripted([(asking, []), ("New address: 101 Highway, New York, NY 10001, USA. Confirm?", []), (asking, [])])
+        self.assertIn("NY 10001", tau_rules.turn(("address",), gave, [], ask, state, False)[0])
+        self.assertEqual(state.holds, ["state"])
+        self.assertEqual(tau_rules.turn(("address",), gave, [], lambda items, tools: (asking, []), state, False)[0], asking)  # once
+        blank = tau_rules.fix_address(call("modify_user_address", user_id="u", state="", country="", zip="10001"))
+        self.assertEqual((blank["arguments"]["state"], blank["arguments"]["country"]), ("NY", "USA"))
+
     def test_an_early_transfer_is_refused_once_without_the_tool(self):
         tools = [{"type": "function", "function": {"name": "transfer_to_human_agents"}}, {"type": "function", "function": {"name": "get_user_details"}}]
         transfer = ("", [call("transfer_to_human_agents", summary="s")])
@@ -1260,6 +1297,10 @@ class RetailRulesTests(Base):
         self.assertEqual(asked[1][1], ["get_user_details"])
         ask, asked = self.scripted([transfer])
         self.assertEqual(tau_rules.turn(("handover-once",), [{"role": "user", "text": "Then nothing else."}], tools, ask, state, False), transfer)
+        self.assertEqual(state.holds, ["handover-once"])  # the second goes through
+        ask, asked = self.scripted([transfer])
+        self.assertEqual(tau_rules.turn(("handover-once",), [{"role": "user", "text": "Get me a supervisor."}], tools, ask, tau_rules.RuleState(), True),
+                         transfer)  # the customer asked: never refused
         ask, asked = self.scripted([transfer, transfer])
         with self.assertRaises(tau_rules.RuleError):
             tau_rules.turn(("handover-once",), [{"role": "user", "text": "hi"}], tools, ask, tau_rules.RuleState(), False)
