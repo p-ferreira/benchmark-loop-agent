@@ -15,7 +15,7 @@ they can be run on recorded conversations.
 ``payment``       an item change or exchange is held once when the customer has several payment methods on file and
                   has named none: the model is told to ask which one takes the price difference.
 ``address``       address fields of a write call are put in the database's forms ("USA", two-letter state); a reply that
-                  asks the customer for the state or country is held once with the state looked up from the ZIP code.
+                  asks the customer for the state or country is held with the state looked up from the ZIP code.
 ``handover-once`` the first transfer made before the customer asked for a person is refused, once in a conversation:
                   the model must say what it cannot do and ask whether there is anything else.
 """
@@ -366,6 +366,9 @@ STATE_NOTE = (
     "with the address the customer gave (summarise it in full and ask for their confirmation as the policy requires).")
 
 
+STATE_HOLDS = 3  # the model asked again after one note in a smoke run of the second round
+
+
 def state_for_zip(code: str) -> str | None:
     """The two-letter state of a five-digit ZIP code; ``None`` when the prefix is not in the table."""
     if not (isinstance(code, str) and len(code.strip()) == 5 and code.strip().isdigit()):
@@ -481,8 +484,8 @@ def _hold(rules: tuple[str, ...], items: Items, calls: Calls, state: RuleState, 
 
 
 def _text_hold(rules: tuple[str, ...], items: Items, text: str, calls: Calls, state: RuleState) -> tuple[str, str] | None:
-    """A hold that reads the reply's words: the question about the state or country, once in a conversation."""
-    if "address" in rules and "state" not in state.holds:
+    """A hold that reads the reply's words: the question about the state or country, a few times in a conversation."""
+    if "address" in rules and state.holds.count("state") < STATE_HOLDS:
         note = asks_state_or_country(items, text, calls)
         if note:
             return "state", note

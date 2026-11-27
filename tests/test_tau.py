@@ -1267,7 +1267,7 @@ class RetailRulesTests(Base):
         self.assertEqual(tau_rules.turn(("offers",), self.ITEMS, [], ask, state, False)[1], [])
         self.assertEqual(state.holds, ["same-item"])
 
-    def test_the_state_is_looked_up_from_the_zip_code_and_a_reply_asking_for_it_is_held_once(self):
+    def test_the_state_is_looked_up_from_the_zip_code_and_a_reply_asking_for_it_is_held(self):
         self.assertEqual([tau_rules.state_for_zip(code) for code in ("10001", "80280", "62701", "20307", "20156", "1000", "abcde", None)],
                          ["NY", "CO", "IL", "DC", None, None, None, None])
         gave = [{"role": "user", "text": "Change order #W9911714 to 101 Highway, New York, 10001."}]
@@ -1283,7 +1283,8 @@ class RetailRulesTests(Base):
         ask, asked = self.scripted([(asking, []), ("New address: 101 Highway, New York, NY 10001, USA. Confirm?", []), (asking, [])])
         self.assertIn("NY 10001", tau_rules.turn(("address",), gave, [], ask, state, False)[0])
         self.assertEqual(state.holds, ["state"])
-        self.assertEqual(tau_rules.turn(("address",), gave, [], lambda items, tools: (asking, []), state, False)[0], asking)  # once
+        self.assertEqual(tau_rules.turn(("address",), gave, [], lambda items, tools: (asking, []), state, False)[0], asking)
+        self.assertEqual(state.holds, ["state"] * tau_rules.STATE_HOLDS)  # a model that keeps asking is held a few times, then let through
         blank = tau_rules.fix_address(call("modify_user_address", user_id="u", state="", country="", zip="10001"))
         self.assertEqual((blank["arguments"]["state"], blank["arguments"]["country"]), ("NY", "USA"))
 
