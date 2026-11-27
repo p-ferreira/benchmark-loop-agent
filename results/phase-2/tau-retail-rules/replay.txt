@@ -1,0 +1,10 @@
+5 runs of gpt-6-luna, 47 tasks: 123 failed and 817 passed conversations
+conversations in which the rule steps in at least once:
+  address: call corrected                       failed   4  passed   0   tasks among the failed: 22 59
+  address: reply asking for the country held    failed  26  passed  49   tasks among the failed: 22 59 71 86 112
+  handover-once                                 failed  44  passed  65   tasks among the failed: 18 19 21 26 32 36 59 63 68 71 79 97 102 104 107
+  payment                                       failed   8  passed  23   tasks among the failed: 71 74
+  products                                      failed  64  passed 506   tasks among the failed: 6 18 19 21 23 36 42 49 56 64 70 71 74 78 79 86 97 102 104 107 112
+  fail     6  address correction: makes the call the expected one
+  fail     8  payment held: the call's method is not the expected one
+  pass    23  payment held: the call's method is the expected one

@@ -155,6 +155,10 @@ def build_report(directory: Path, rates_path: Path = RATES_FILE) -> str:
                f"replies asked again for announcing a transfer without it: {sum((r.get('agent_handover') or {}).get('refused_replies', 0) for r in mine)}; "
                f"announcements that reached the customer anyway: {sum((r.get('agent_handover') or {}).get('announced_without_tool', 0) for r in mine)}"]
               if parameters.get("handover_rule") else []),
+            *([f"- rules in code: {', '.join(parameters['rules'])}; replies held and asked again: "
+               + (", ".join(f"{name} {sum((r.get('agent_rules') or {}).get('holds', []).count(name) for r in mine)}" for name in ("handover-once", "payment", "country")))
+               + f"; address calls corrected: {sum((r.get('agent_rules') or {}).get('address_corrections', 0) for r in mine)}"]
+              if parameters.get("rules") else []),
             "", "## Conversations", "",
             f"- tasks: {len(task_ids)}; trials: {trials}; conversations asked for: {len(wanted)}",
             f"- scored: {len(scored)}; unscored: {len(unscored)}; no record yet: {len(wanted) - len(mine)}", ""]

@@ -12,6 +12,7 @@ from ..runner import PROVIDERS
 from . import upstream
 from .batch import RunParameters, run_retail
 from .report import RATES_FILE, build_report
+from .rules import RULES
 
 EXIT_DONE = 0
 EXIT_SOME_UNSCORED = 3  # argparse uses 2 for bad usage
@@ -40,6 +41,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "reply after a call that changed something (off by default)")
     parser.add_argument("--handover-rule", action="store_true",
                         help="do not send the model the transfer tool until the customer has asked for a person (off by default)")
+    parser.add_argument("--rules", metavar="NAMES", default="",
+                        help="retail rules in code, comma-separated: " + ", ".join(RULES) + " (off by default; see tau/rules.py)")
     parser.add_argument("--seed", type=int, default=300, help="seed of the trial seeds, as upstream's runner (default: 300)")
     parser.add_argument("--report", type=Path, metavar="DIR", help="write the report of a finished or partial run directory and stop")
     parser.add_argument("--rates", type=Path, default=RATES_FILE, metavar="FILE",
@@ -50,6 +53,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    chosen_rules = tuple(name.strip() for name in args.rules.split(",") if name.strip())
+    if set(chosen_rules) - set(RULES) or len(set(chosen_rules)) != len(chosen_rules):
+        parser.error(f"--rules takes distinct names among: {', '.join(RULES)}")
     if args.report is not None:
         try:
             print(build_report(args.report, args.rates), end="")
@@ -77,7 +83,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ids = list(args.tasks)
         elif args.limit is not None:
             ids = ids[:args.limit]
-        parameters = RunParameters(args.provider, model, args.user_model, tuple(ids), args.trials, args.seed, instruction, args.concurrency, args.finish_check, args.handover_rule)
+        parameters = RunParameters(args.provider, model, args.user_model, tuple(ids), args.trials, args.seed, instruction, args.concurrency, args.finish_check, args.handover_rule, chosen_rules)
         records = run_retail(args.output_dir, parameters, environment, send_request)
     except (ValueError, RuntimeError) as error:
         parser.error(str(error))

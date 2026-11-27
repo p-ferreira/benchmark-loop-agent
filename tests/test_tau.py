@@ -819,6 +819,7 @@ class CommandTests(Base):
 
 from benchmark_loop_agent.tau import report  # noqa: E402
 from benchmark_loop_agent.tau.report import build_report  # noqa: E402
+from benchmark_loop_agent.tau import rules as tau_rules  # noqa: E402
 
 if __name__ == "__main__":
     unittest.main()
@@ -1033,3 +1034,138 @@ class HandoverRuleTests(Base):
         from benchmark_loop_agent.tau.report import RATES_FILE, build_report
         self.run_ruled(ScriptedAgent(TASK))
         self.assertIn("- hand-over rule: on", build_report(self.directory, RATES_FILE))
+
+
+class RetailRulesTests(Base):
+    """``--rules``: retail rules in code (``tau/rules.py``)."""
+
+    def run_ruled(self, send, rules=tau_rules.RULES, completion=None, provider="openai"):
+        parameters = RunParameters(provider, "agent-model", "gpt-6-sol", (TASK_ID,), 1, 300, None, 1, False, False, tuple(rules))
+        with mock.patch.object(UP.llm_utils, "completion", completion or ScriptedLitellm(TASK)):
+            return run_retail(self.directory, parameters, environment(provider), send)
+
+    @staticmethod
+    def call(name, **arguments):
+        return {"id": "c1", "name": name, "arguments": arguments}
+
+    def test_address_fields_are_put_in_the_forms_of_the_database_and_nothing_else_is_touched(self):
+        fixed = tau_rules.fix_address(self.call("modify_user_address", user_id="u", address1="1 Road", address2="", city="New York",
+                                                state="New York", country="United States", zip="10001"))
+        self.assertEqual((fixed["arguments"]["state"], fixed["arguments"]["country"]), ("NY", "USA"))
+        self.assertEqual(fixed["arguments"]["city"], "New York")  # a city named as a state stays
+        for country in ("", "US", "usa", "U.S.A.", "United States of America"):
+            self.assertEqual(tau_rules.fix_address(self.call("modify_pending_order_address", order_id="#W1", state="tx",
+                                                             country=country))["arguments"], {"order_id": "#W1", "state": "TX", "country": "USA"})
+        right = self.call("modify_user_address", user_id="u", state="CO", country="USA")
+        self.assertIs(tau_rules.fix_address(right), right)
+        abroad = self.call("modify_user_address", user_id="u", state="Ontario", country="Canada")
+        self.assertIs(tau_rules.fix_address(abroad), abroad)  # not a form of the same value: left as the model wrote it
+        other = self.call("cancel_pending_order", order_id="#W1", reason="no longer needed", country="United States")
+        self.assertIs(tau_rules.fix_address(other), other)
+
+    def test_a_reply_asking_for_the_country_is_recognised_and_a_summary_stating_it_is_not(self):
+        self.assertTrue(tau_rules.asks_for_country("I still need the state and country before I can prepare the update.", []))
+        self.assertFalse(tau_rules.asks_for_country("New address: 1 Road, New York, NY 10001, USA. Country: USA. Confirm?", []))
+        self.assertFalse(tau_rules.asks_for_country("Which order would you like to change?", []))
+        self.assertFalse(tau_rules.asks_for_country("What country?", [self.call("get_user_details", user_id="u")]))
+
+    def test_a_product_is_shown_as_its_available_variants_cheapest_first(self):
+        product = {"name": "Mug", "product_id": "p1", "variants": {
+            "3": {"item_id": "3", "options": {"color": "red"}, "available": True, "price": 9.5},
+            "1": {"item_id": "1", "options": {"color": "blue"}, "available": False, "price": 1.0},
+            "2": {"item_id": "2", "options": {"color": "black"}, "available": True, "price": 7.25}}}
+        shown = json.loads(tau_rules.product_table(json.dumps(product)))
+        self.assertEqual([v["item_id"] for v in shown["available_variants_cheapest_first"]], ["2", "3"])
+        self.assertEqual(shown["available_variants_cheapest_first"][0], {"item_id": "2", "price": 7.25, "options": {"color": "black"}})
+        self.assertEqual(shown["unavailable_item_ids"], ["1"])
+        self.assertEqual(tau_rules.product_table("Error: Product not found"), "Error: Product not found")
+        self.assertEqual(tau_rules.product_table('{"order_id": "#W1"}'), '{"order_id": "#W1"}')
+        items = [{"role": "assistant", "text": "", "calls": [self.call("get_product_details", product_id="p1"),
+                                                             {"id": "c2", "name": "get_order_details", "arguments": {}}]},
+                 {"role": "tool", "id": "c1", "text": json.dumps(product)}, {"role": "tool", "id": "c2", "text": json.dumps(product)}]
+        shown_items = tau_rules.shown_items(items)
+        self.assertIn("cheapest first", shown_items[1]["text"])
+        self.assertEqual(shown_items[2], items[2])  # only the product tool's results
+        self.assertEqual(items[1]["text"], json.dumps(product))  # the kept conversation is not changed
+
+    def payment_items(self, methods, customer="Please swap the mug for the black one."):
+        return [{"role": "user", "text": customer},
+                {"role": "assistant", "text": "", "calls": [{"id": "u1", "name": "get_user_details", "arguments": {"user_id": "u"}}]},
+                {"role": "tool", "id": "u1", "text": json.dumps({"payment_methods": {name: {} for name in methods}})}]
+
+    def test_an_item_change_is_held_only_when_several_methods_are_on_file_and_the_customer_named_none(self):
+        change = [self.call("modify_pending_order_items", order_id="#W1", item_ids=["1"], new_item_ids=["2"], payment_method_id="paypal_1")]
+        exchange = [self.call("exchange_delivered_order_items", order_id="#W1", item_ids=["1"], new_item_ids=["2"], payment_method_id="paypal_1")]
+        two = ["paypal_1", "credit_card_2"]
+        self.assertIn("which payment method", tau_rules.payment_not_chosen(self.payment_items(two), change))
+        self.assertIsNotNone(tau_rules.payment_not_chosen(self.payment_items(two), exchange))
+        self.assertIsNone(tau_rules.payment_not_chosen(self.payment_items(["paypal_1"]), change))  # one method: nothing to choose
+        self.assertIsNone(tau_rules.payment_not_chosen(self.payment_items(two, "Swap it and use my credit card."), change))
+        self.assertIsNone(tau_rules.payment_not_chosen(self.payment_items(two, "Swap it, same payment method."), change))
+        self.assertIsNone(tau_rules.payment_not_chosen([{"role": "user", "text": "Swap it."}], change))  # the customer's details were never read
+        self.assertIsNone(tau_rules.payment_not_chosen(self.payment_items(two), [self.call("cancel_pending_order", order_id="#W1")]))
+        self.assertIsNone(tau_rules.payment_not_chosen(self.payment_items(two), [self.call("return_delivered_order_items", order_id="#W1")]))
+
+    def test_only_the_first_transfer_made_before_the_customer_asked_is_an_early_one(self):
+        transfer = [self.call("transfer_to_human_agents", summary="s")]
+        self.assertTrue(tau_rules.first_early_transfer([{"role": "user", "text": "hi"}], transfer, False))
+        self.assertFalse(tau_rules.first_early_transfer([{"role": "user", "text": "a supervisor"}], transfer, True))
+        self.assertFalse(tau_rules.first_early_transfer([{"role": "user", "text": "hi"}], [self.call("get_user_details")], False))
+        self.assertFalse(tau_rules.first_early_transfer([{"role": "assistant", "text": "", "calls": transfer}], transfer, False))
+
+    def test_with_the_rules_on_and_nothing_to_step_in_on_the_requests_are_the_same(self):
+        plain = ScriptedAgent(TASK)
+        self.run_ruled(plain, rules=())
+        self.directory = self.directory.parent / "ruled"
+        ruled = ScriptedAgent(TASK)
+        records = self.run_ruled(ruled)
+        self.assertEqual(records[0]["outcome"], "pass")
+        self.assertEqual([r["input"] for r in ruled.requests], [r["input"] for r in plain.requests])
+        self.assertEqual(self.records()[0]["agent_rules"], {"holds": [], "address_corrections": 0})
+        self.assertEqual(batch.read_manifest(self.directory)["parameters"]["rules"], sorted(tau_rules.RULES))
+        self.assertIn("rules in code: address, handover-once, payment, products",
+                      build_report(self.directory, Path(__file__).resolve().parent.parent / "data" / "rates.json"))
+
+    def test_a_run_without_rules_records_nothing_about_them(self):
+        self.run_ruled(ScriptedAgent(TASK), rules=())
+        self.assertNotIn("agent_rules", self.records()[0])
+        self.assertNotIn("rules", batch.read_manifest(self.directory)["parameters"])
+
+    def test_an_early_transfer_is_refused_once_without_the_tool_and_the_note_is_not_kept(self):
+        requests = []
+
+        def send(provider, api_key, request):
+            requests.append(request)
+            last = request["input"][-1]
+            if last.get("role") == "user" and "Do not transfer in this reply" in last["content"]:
+                return openai_reply(text="I cannot do that under the policy. Is there anything else I can help with?")
+            if sum(1 for i in request["input"] if i.get("role") == "assistant") > 1:
+                return openai_reply(text=FINAL_TEXT)
+            return openai_reply(calls=[("transfer_to_human_agents", {"summary": "wants a change"})])
+
+        self.run_ruled(send, rules=("handover-once",))
+        self.assertEqual(self.records()[0]["agent_rules"]["holds"], ["handover-once"])
+        names = [[t["name"] for t in r["tools"]] for r in requests]
+        self.assertIn("transfer_to_human_agents", names[0])
+        self.assertNotIn("transfer_to_human_agents", names[1])  # the ask after the refusal cannot transfer
+        self.assertEqual(requests[1]["input"][:-1], requests[0]["input"])
+        self.assertIn("transfer_to_human_agents", names[2])  # from the next turn on the tool is back
+        self.assertNotIn(tau_rules.HEADER, json.dumps(requests[2]["input"]))  # the note is not kept
+        conversation = (self.directory / batch.CONVERSATIONS_FILE).read_text()
+        self.assertNotIn("transfer_to_human_agents", conversation)  # the refused call never reached the tools
+
+    def test_an_address_call_reaches_the_tools_in_the_forms_of_the_database(self):
+        def send(provider, api_key, request):
+            if any(i.get("type") == "function_call_output" for i in request["input"]):
+                return openai_reply(text=FINAL_TEXT)
+            return openai_reply(calls=[("modify_user_address", {"user_id": "nobody", "address1": "1 Road", "address2": "", "city": "New York",
+                                                                "state": "New York", "country": "United States", "zip": "10001"})])
+
+        self.run_ruled(send, rules=("address",))
+        self.assertEqual(self.records()[0]["agent_rules"], {"holds": [], "address_corrections": 1})
+        conversation = (self.directory / batch.CONVERSATIONS_FILE).read_text()
+        self.assertIn('"state": "NY", "country": "USA"', conversation)
+
+    def test_the_names_of_the_rules_are_checked_by_the_command(self):
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+            main(["--output-dir", str(self.directory), "--provider", "openai", "--openai-model", "m", "--rules", "address,nope"])

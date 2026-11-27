@@ -47,6 +47,7 @@ class RunParameters:
     concurrency: int = 4
     finish_check: bool = False
     handover_rule: bool = False
+    rules: tuple[str, ...] = ()
 
     def identity(self) -> dict[str, Any]:
         """Everything that decides which conversations a directory holds and how they were run."""
@@ -55,6 +56,8 @@ class RunParameters:
             identity["finish_check"] = True
         if self.handover_rule:
             identity["handover_rule"] = True
+        if self.rules:
+            identity["rules"] = sorted(self.rules)
         return identity
 
     def _identity(self) -> dict[str, Any]:
@@ -245,7 +248,7 @@ def run_retail(directory: Path, parameters: RunParameters, environment: Mapping[
     pending = store.pending(parameters.task_ids, parameters.trials)
     seeds = trial_seeds(parameters.seed, parameters.trials)
     settings = Settings(parameters.provider, parameters.agent_model, parameters.user_model, parameters.instruction, parameters.finish_check,
-                        parameters.handover_rule)
+                        parameters.handover_rule, tuple(parameters.rules))
 
     number = len(previous["sessions"]) + 1 if previous else 1
     run_id = (previous or {}).get("run_id") or uuid.uuid4().hex
