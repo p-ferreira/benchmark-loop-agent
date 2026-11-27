@@ -72,6 +72,8 @@ def points():
                 here = wanted & set(variants)
                 if not here:
                     continue
+                if any(call["name"] in rules.ITEM_CHANGES for earlier in items[:position] if earlier["role"] == "assistant" for call in earlier["calls"]):
+                    break  # an item change was already written by then: no offer is left to make
                 found.append({"failed": c["outcome"] == "fail", "task": c["task_id"], "run": run, "trial": c["trial"], "items": items[:position],
                               "expected": sorted(here), "variants": variants, "recorded_reply": item["text"]})
                 break

@@ -1090,15 +1090,11 @@ class RetailRulesTests(Base):
         self.assertEqual(no_order["items_in_stock_that_match_cheapest_first"][0]["price_difference_against_current_item"],
                          "6.25 (the customer pays this much more)")  # no order read: the catalogue's price of the current item
 
-    def test_the_same_item_except_for_one_option_keeps_every_other_option(self):
-        found = self.search(current_item_id="1", keep_other_options_of_current_item=True, required_options={"color": "red"})
-        self.assertEqual([row["item_id"] for row in found["items_in_stock_that_match_cheapest_first"]], ["3"])  # size S kept
-        self.assertEqual(found["searched_for"], {"color": "red", "size": "s"})
-
-    def test_a_narrowed_search_also_says_what_the_stated_options_alone_allow_and_what_else_the_customer_bought(self):
-        found = self.search(current_item_id="1", keep_other_options_of_current_item=True, required_options={"color": "red"})
-        self.assertEqual([row["item_id"] for row in found["items_in_stock_with_only_the_stated_options_cheapest_first"]], ["3", "4"])
-        self.assertNotIn("items_in_stock_with_only_the_stated_options_cheapest_first", self.search(required_options={"color": "red"}))
+    def test_each_item_says_in_which_options_it_differs_from_the_current_item_and_other_purchases_are_listed(self):
+        found = self.search(current_item_id="1", required_options={"color": "red"})
+        rows = {row["item_id"]: row["differs_from_current_item_in"] for row in found["items_in_stock_that_match_cheapest_first"]}
+        self.assertEqual(rows, {"3": {"color": "red"}, "4": {"color": "red", "size": "L"}})  # item 3 is "the same but in red"
+        self.assertNotIn("differs_from_current_item_in", self.search(required_options={"color": "red"})["items_in_stock_that_match_cheapest_first"][0])
         second = {"order_id": "#W2", "status": "delivered", "items": [{"name": "Mug", "product_id": "p1", "item_id": "5", "price": 11.0, "options": {}},
                                                                       {"name": "Pen", "product_id": "p9", "item_id": "90", "price": 1.0, "options": {}}]}
         items = self.ITEMS + read("get_order_details", second, "o2", order_id="#W2")

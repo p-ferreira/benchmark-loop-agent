@@ -64,18 +64,17 @@ SEARCH_SCHEMA = {"type": "function", "function": {
         "required_options": {"type": "object", "additionalProperties": {"type": "string"},
                              "description": "Only the options the customer requires, by option name, such as {\"color\": \"red\"}. "
                                             "Leave an option out when the customer did not ask for a value of it."},
-        "current_item_id": {"type": "string", "description": "The item the customer has now and wants replaced, when there is one: "
-                                                             "price differences are computed against it."},
-        "keep_other_options_of_current_item": {"type": "boolean",
-                                               "description": "True when the customer wants the same item except for the required "
-                                                              "options: every other option must equal the current item's."},
+        "current_item_id": {"type": "string", "description": "The item the customer has now and wants replaced, when there is one: each "
+                                                             "returned item then says its price difference against it and in which "
+                                                             "options it differs from it."},
         "only_among_item_ids": {"type": "array", "items": {"type": "string"},
                                 "description": "When the customer restricts the choice to particular items (for example \"the cheapest "
                                                "among the other ones in my order\", or \"the same as the one I already have\"), their "
                                                "item ids; the search then looks only at these. The result lists the customer's other "
                                                "bought items of the product."}}}}}
 SEARCH_REMINDERS = (
-    "Present these to the customer as they are. Before the change: all items of one order that the customer wants changed "
+    "Present these to the customer as they are; when several items match, say how they differ and let the customer choose, "
+    "and do not narrow the choice by options the customer did not state. Before the change: all items of one order that the customer wants changed "
     "go in ONE call; an item change locks a pending order, so change its address or payment method first if the customer "
     "asked for that; ask the customer which payment method takes the price difference unless they already said.")
 SUMMARY_NOTE = (f"The variants are not listed here. To choose, compare or price items of this product, call {SEARCH_TOOL}: "
@@ -175,14 +174,11 @@ def search(items: Items, arguments: dict[str, Any]) -> str:
     if unknown:
         return json.dumps({"error": f"This product has no option named {', '.join(map(str, unknown))}.", "option_names": sorted(names.values())})
     wanted = {names[_norm(name)]: _norm(value) for name, value in required.items()}
-    stated = dict(wanted)  # what the call itself requires, before the current item's other options are added
     current_id = arguments.get("current_item_id")
     current = product["variants"].get(str(current_id)) if current_id else None
     if current_id and current is None:
         return json.dumps({"error": f"Item {current_id} is not a variant of product {product_id}. Check the item id and the product id "
                                     "in the order."})
-    if current is not None and arguments.get("keep_other_options_of_current_item"):
-        wanted = {**{name: _norm(value) for name, value in current["options"].items()}, **wanted}
     among = arguments.get("only_among_item_ids")
     among = {str(i) for i in among} if isinstance(among, list) and among else None
     pool = variants if among is None else [v for v in variants if v.get("item_id") in among]
@@ -196,6 +192,9 @@ def search(items: Items, arguments: dict[str, Any]) -> str:
         difference = _difference(float(variant["price"]), old)
         if difference is not None:
             shown["price_difference_against_current_item"] = difference
+        if current is not None:  # so that "the same but in red" can be told from an item that changes more than was asked
+            shown["differs_from_current_item_in"] = {name: value for name, value in variant["options"].items()
+                                                     if _norm(current["options"].get(name)) != _norm(value)}
         return shown
 
     def misses(variant: dict[str, Any]) -> dict[str, Any]:
@@ -220,11 +219,6 @@ def search(items: Items, arguments: dict[str, Any]) -> str:
         result["closest_items_in_stock"] = [{**row(v), "differs_from_what_was_asked_in": misses(v)} for v in nearest]
         result["values_in_stock_for_each_option"] = {name: sorted({v["options"][name] for v in in_stock if name in v["options"]})
                                                      for name in sorted(names.values())}
-    if wanted != stated:  # the narrower search may be narrower than the customer meant: what the stated options alone allow
-        wider = sorted((v for v in in_stock if all(_norm(v["options"].get(n)) == value for n, value in stated.items())),
-                       key=lambda v: (v["price"], v["item_id"]))
-        if [v["item_id"] for v in wider] != [v["item_id"] for v in matches]:
-            result["items_in_stock_with_only_the_stated_options_cheapest_first"] = [row(v) for v in wider]
     owned = _other_purchases(items, product_id, str(current_id) if current_id else None, product)
     if owned:
         result["other_items_of_this_product_the_customer_bought"] = owned

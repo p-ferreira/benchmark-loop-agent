@@ -1,51 +1,50 @@
-dev: 12 failed and 12 passed points; tasks ['6', '21', '36', '49', '58', '64', '71', '74', '79', '85', '102', '112']
+dev: 11 failed and 12 passed points; tasks ['6', '21', '23', '42', '56', '63', '70', '78', '80', '86', '97', '112']
   failed task   6 design-luna     trial 2 prefix  18 items; recorded reply graded wrong
-  failed task  21 control-luna    trial 3 prefix  24 items; recorded reply graded right
-  failed task  36 control-luna    trial 3 prefix  28 items; recorded reply graded right
-  failed task  49 control-luna    trial 2 prefix  20 items; recorded reply graded wrong
-  failed task  64 luna            trial 2 prefix  16 items; recorded reply graded wrong
-  failed task  71 treatment-luna  trial 1 prefix  21 items; recorded reply graded wrong
-  failed task  79 treatment-luna  trial 3 prefix  18 items; recorded reply graded wrong
-  failed task 102 control-luna    trial 2 prefix  20 items; recorded reply graded unclear
-  failed task 112 luna            trial 2 prefix  22 items; recorded reply graded right
-  failed task  36 treatment-luna  trial 1 prefix  30 items; recorded reply graded right
-  failed task  49 design-luna     trial 2 prefix  20 items; recorded reply graded wrong
-  failed task  64 luna            trial 3 prefix  12 items; recorded reply graded wrong
-  passed task   6 luna            trial 0 prefix  16 items; recorded reply graded right
-  passed task  21 luna            trial 0 prefix  18 items; recorded reply graded right
-  passed task  36 luna            trial 0 prefix  26 items; recorded reply graded right
-  passed task  49 control-luna    trial 0 prefix  20 items; recorded reply graded right
-  passed task  64 luna            trial 0 prefix  14 items; recorded reply graded right
-  passed task  71 luna            trial 0 prefix  18 items; recorded reply graded right
-  passed task  79 luna            trial 0 prefix  16 items; recorded reply graded unclear
-  passed task 102 luna            trial 0 prefix  22 items; recorded reply graded unclear
-  passed task 112 luna            trial 1 prefix  26 items; recorded reply graded right
-  passed task  58 luna            trial 0 prefix  14 items; recorded reply graded wrong
-  passed task  74 luna            trial 0 prefix  18 items; recorded reply graded right
-  passed task  85 luna            trial 0 prefix  24 items; recorded reply graded right
-reserve: 12 failed and 12 passed points; tasks ['8', '18', '23', '42', '56', '63', '70', '78', '80', '86', '97', '107']
-  failed task  18 control-luna    trial 1 prefix  18 items; recorded reply graded unclear
   failed task  23 luna            trial 1 prefix  18 items; recorded reply graded right
   failed task  42 luna            trial 3 prefix  28 items; recorded reply graded wrong
-  failed task  56 luna            trial 3 prefix  20 items; recorded reply graded wrong
+  failed task  56 design-luna     trial 0 prefix  18 items; recorded reply graded wrong
   failed task  70 design-luna     trial 2 prefix  18 items; recorded reply graded wrong
   failed task  78 control-luna    trial 0 prefix  24 items; recorded reply graded wrong
   failed task  86 control-luna    trial 0 prefix  14 items; recorded reply graded unclear
-  failed task 107 control-luna    trial 0 prefix  12 items; recorded reply graded wrong
-  failed task  18 design-luna     trial 0 prefix  18 items; recorded reply graded unclear
+  failed task 112 luna            trial 2 prefix  22 items; recorded reply graded right
   failed task  23 treatment-luna  trial 3 prefix  26 items; recorded reply graded wrong
   failed task  42 treatment-luna  trial 2 prefix  27 items; recorded reply graded wrong
-  failed task  56 design-luna     trial 0 prefix  18 items; recorded reply graded wrong
-  passed task  18 luna            trial 0 prefix  16 items; recorded reply graded right
+  failed task  23 design-luna     trial 0 prefix  28 items; recorded reply graded wrong
+  passed task   6 luna            trial 0 prefix  16 items; recorded reply graded right
   passed task  23 luna            trial 0 prefix  19 items; recorded reply graded right
   passed task  42 luna            trial 0 prefix  28 items; recorded reply graded right
   passed task  56 luna            trial 0 prefix  18 items; recorded reply graded right
   passed task  70 luna            trial 0 prefix  18 items; recorded reply graded wrong
   passed task  78 luna            trial 0 prefix  26 items; recorded reply graded right
   passed task  86 luna            trial 0 prefix  20 items; recorded reply graded right
-  passed task 107 luna            trial 0 prefix  12 items; recorded reply graded unclear
-  passed task   8 luna            trial 0 prefix  14 items; recorded reply graded right
+  passed task 112 luna            trial 1 prefix  26 items; recorded reply graded right
+  passed task  21 luna            trial 0 prefix  18 items; recorded reply graded right
   passed task  63 luna            trial 0 prefix  17 items; recorded reply graded right
   passed task  80 luna            trial 0 prefix  12 items; recorded reply graded right
   passed task  97 luna            trial 0 prefix  14 items; recorded reply graded right
-all points: 37 failed, 422 passed
+reserve: 12 failed and 12 passed points; tasks ['8', '18', '36', '49', '58', '64', '71', '74', '79', '85', '102', '107']
+  failed task  18 control-luna    trial 1 prefix  18 items; recorded reply graded unclear
+  failed task  36 control-luna    trial 3 prefix  28 items; recorded reply graded right
+  failed task  49 control-luna    trial 2 prefix  20 items; recorded reply graded wrong
+  failed task  64 luna            trial 2 prefix  16 items; recorded reply graded wrong
+  failed task  71 treatment-luna  trial 1 prefix  21 items; recorded reply graded wrong
+  failed task  79 treatment-luna  trial 3 prefix  18 items; recorded reply graded wrong
+  failed task 107 control-luna    trial 0 prefix  12 items; recorded reply graded unclear
+  failed task  18 design-luna     trial 0 prefix  18 items; recorded reply graded unclear
+  failed task  36 treatment-luna  trial 1 prefix  30 items; recorded reply graded right
+  failed task  49 design-luna     trial 2 prefix  20 items; recorded reply graded wrong
+  failed task  64 luna            trial 3 prefix  12 items; recorded reply graded wrong
+  failed task  79 design-luna     trial 2 prefix  16 items; recorded reply graded wrong
+  passed task  18 luna            trial 0 prefix  16 items; recorded reply graded right
+  passed task  36 luna            trial 0 prefix  26 items; recorded reply graded right
+  passed task  49 control-luna    trial 0 prefix  20 items; recorded reply graded right
+  passed task  64 luna            trial 0 prefix  14 items; recorded reply graded right
+  passed task  71 luna            trial 0 prefix  18 items; recorded reply graded right
+  passed task  79 luna            trial 0 prefix  16 items; recorded reply graded unclear
+  passed task 107 luna            trial 0 prefix  12 items; recorded reply graded unclear
+  passed task   8 luna            trial 0 prefix  14 items; recorded reply graded right
+  passed task  58 luna            trial 0 prefix  14 items; recorded reply graded unclear
+  passed task  74 luna            trial 0 prefix  18 items; recorded reply graded right
+  passed task  85 luna            trial 0 prefix  24 items; recorded reply graded right
+  passed task 102 luna            trial 0 prefix  22 items; recorded reply graded unclear
+all points: 34 failed, 421 passed
