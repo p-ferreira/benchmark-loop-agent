@@ -1077,7 +1077,7 @@ class RetailRulesTests(Base):
         shown = json.loads(tau_rules.product_table(json.dumps(product)))
         self.assertEqual([v["item_id"] for v in shown["available_variants_cheapest_first"]], ["2", "3"])
         self.assertEqual(shown["available_variants_cheapest_first"][0], {"item_id": "2", "price": 7.25, "options": {"color": "black"}})
-        self.assertEqual(shown["unavailable_item_ids"], ["1"])
+        self.assertEqual(shown["unavailable_variants"], [{"item_id": "1", "price": 1.0, "options": {"color": "blue"}}])
         self.assertEqual(tau_rules.product_table("Error: Product not found"), "Error: Product not found")
         self.assertEqual(tau_rules.product_table('{"order_id": "#W1"}'), '{"order_id": "#W1"}')
         items = [{"role": "assistant", "text": "", "calls": [self.call("get_product_details", product_id="p1"),
@@ -1123,7 +1123,7 @@ class RetailRulesTests(Base):
         self.assertEqual([r["input"] for r in ruled.requests], [r["input"] for r in plain.requests])
         self.assertEqual(self.records()[0]["agent_rules"], {"holds": [], "address_corrections": 0})
         self.assertEqual(batch.read_manifest(self.directory)["parameters"]["rules"], sorted(tau_rules.RULES))
-        self.assertIn("rules in code: address, handover-once, payment, products",
+        self.assertIn("rules in code: address, country, handover-once, payment, products",
                       build_report(self.directory, Path(__file__).resolve().parent.parent / "data" / "rates.json"))
 
     def test_a_run_without_rules_records_nothing_about_them(self):

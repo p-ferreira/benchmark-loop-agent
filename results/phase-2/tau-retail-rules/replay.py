@@ -60,7 +60,7 @@ for run in RUNS:
                         detail[outcome, "address correction: " + ("expected call before and after" if was and now else
                                "makes the call the expected one" if now else "breaks an expected call" if was else "call still not the expected one")] += 1
                 if rules.asks_for_country(text, calls):
-                    hit.add("address: reply asking for the country held")
+                    hit.add("country: reply asking for the country held")
                 if not paid and rules.payment_not_chosen(items, calls):
                     paid = True
                     hit.add("payment")

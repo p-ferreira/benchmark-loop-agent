@@ -5,9 +5,10 @@ conversations of a cheap model; none reads the task, an expected action or a sco
 over the conversation as the agent keeps it (``items``: role, text, calls), so that where each one steps in
 can be counted on recorded conversations without a model call.
 
-``address``       address fields of a write call are put in the database's forms ("USA", two-letter state), and a
-                  reply that asks the customer for the country is held once.
-``products``      the result of ``get_product_details`` is shown as available variants only, cheapest first.
+``address``       address fields of a write call are put in the database's forms ("USA", two-letter state).
+``country``       a reply that asks the customer for the country is held once: every address in the store is in the USA.
+``products``      the result of ``get_product_details`` is shown with the available variants cheapest first and the
+                  unavailable ones apart.
 ``payment``       an item change or exchange is held once when the customer has several payment methods on file and
                   has named none: the model is told to ask which one takes the price difference.
 ``handover-once`` the first transfer of a conversation, made before the customer asked for a person, is refused
@@ -18,7 +19,7 @@ import json
 import re
 from typing import Any
 
-RULES = ("address", "products", "payment", "handover-once")
+RULES = ("address", "country", "products", "payment", "handover-once")
 HEADER = "Check by the system. This is not a message from the customer, and the customer does not see it."
 
 # --- address ----------------------------------------------------------------------------------
@@ -73,7 +74,8 @@ def said_country_is_set(text: str) -> bool:
 # --- products ---------------------------------------------------------------------------------
 
 PRODUCT_TOOL = "get_product_details"
-PRODUCT_NOTE = "Shown by the system: available variants only, cheapest first. Variants in unavailable_item_ids cannot be ordered."
+PRODUCT_NOTE = ("Shown by the system: the variants that can be ordered, cheapest first; unavailable_variants cannot be ordered "
+                "(an item the customer already has may be among them).")
 
 
 def product_table(text: str) -> str:
@@ -85,7 +87,8 @@ def product_table(text: str) -> str:
         shown = {"name": product["name"], "product_id": product["product_id"], "note": PRODUCT_NOTE,
                  "available_variants_cheapest_first": [{"item_id": v["item_id"], "price": v["price"], "options": v["options"]}
                                                        for v in available],
-                 "unavailable_item_ids": sorted(v["item_id"] for v in variants if not v["available"])}
+                 "unavailable_variants": [{"item_id": v["item_id"], "price": v["price"], "options": v["options"]}
+                                          for v in sorted((v for v in variants if not v["available"]), key=lambda v: v["item_id"])]}
     except (ValueError, KeyError, TypeError, AttributeError):
         return text
     return json.dumps(shown)

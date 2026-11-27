@@ -466,7 +466,7 @@ def make_agent_class() -> type:
                 tools = [tool for tool in tools if tool["function"]["name"] != HANDOVER_TOOL]
             elif "payment" in self.rules and "payment" not in self.usage.rule_holds and retail_rules.payment_not_chosen(items, calls):
                 held = "payment", retail_rules.payment_not_chosen(items, calls)
-            elif "address" in self.rules and "country" not in self.usage.rule_holds and retail_rules.asks_for_country(text, calls):
+            elif "country" in self.rules and "country" not in self.usage.rule_holds and retail_rules.asks_for_country(text, calls):
                 held = "country", retail_rules.COUNTRY_NOTE.format(held=json.dumps(text, ensure_ascii=False))
             if held is not None:
                 self.usage.rule_holds.append(held[0])
