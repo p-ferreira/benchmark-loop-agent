@@ -70,8 +70,10 @@ SEARCH_SCHEMA = {"type": "function", "function": {
                                                "description": "True when the customer wants the same item except for the required "
                                                               "options: every other option must equal the current item's."},
         "only_among_item_ids": {"type": "array", "items": {"type": "string"},
-                                "description": "When the customer restricts the choice to particular items (for example the other "
-                                               "items of an order), their item ids; the search then looks only at these."}}}}}
+                                "description": "When the customer restricts the choice to particular items (for example \"the cheapest "
+                                               "among the other ones in my order\", or \"the same as the one I already have\"), their "
+                                               "item ids; the search then looks only at these. The result lists the customer's other "
+                                               "bought items of the product."}}}}}
 SEARCH_REMINDERS = (
     "Present these to the customer as they are. Before the change: all items of one order that the customer wants changed "
     "go in ONE call; an item change locks a pending order, so change its address or payment method first if the customer "
@@ -134,6 +136,20 @@ def _purchase_price(items: Items, item_id: str) -> float | None:
     return None
 
 
+def _other_purchases(items: Items, product_id: str, current_id: str | None, product: dict[str, Any]) -> list[dict[str, Any]]:
+    """The customer's other bought items of this product, from the orders read: for \"the same as my other one\" and \"among my other ones\"."""
+    bought: dict[str, dict[str, Any]] = {}
+    for _, text in results_of(items, ORDER_TOOL):
+        order = _json(text)
+        for line in (order.get("items") or []) if isinstance(order, dict) else []:
+            if isinstance(line, dict) and str(line.get("product_id")) == product_id and line.get("item_id") != current_id:
+                variant = product["variants"].get(str(line.get("item_id")))
+                bought[str(line.get("item_id"))] = {"item_id": line.get("item_id"), "in_order": order.get("order_id"), "options": line.get("options"),
+                                                  "in_stock_now": bool(variant and variant.get("available")),
+                                                  "price_now": variant.get("price") if variant else None}
+    return list(bought.values())
+
+
 def _difference(new: float, old: float | None) -> str | None:
     if old is None:
         return None
@@ -159,6 +175,7 @@ def search(items: Items, arguments: dict[str, Any]) -> str:
     if unknown:
         return json.dumps({"error": f"This product has no option named {', '.join(map(str, unknown))}.", "option_names": sorted(names.values())})
     wanted = {names[_norm(name)]: _norm(value) for name, value in required.items()}
+    stated = dict(wanted)  # what the call itself requires, before the current item's other options are added
     current_id = arguments.get("current_item_id")
     current = product["variants"].get(str(current_id)) if current_id else None
     if current_id and current is None:
@@ -203,6 +220,14 @@ def search(items: Items, arguments: dict[str, Any]) -> str:
         result["closest_items_in_stock"] = [{**row(v), "differs_from_what_was_asked_in": misses(v)} for v in nearest]
         result["values_in_stock_for_each_option"] = {name: sorted({v["options"][name] for v in in_stock if name in v["options"]})
                                                      for name in sorted(names.values())}
+    if wanted != stated:  # the narrower search may be narrower than the customer meant: what the stated options alone allow
+        wider = sorted((v for v in in_stock if all(_norm(v["options"].get(n)) == value for n, value in stated.items())),
+                       key=lambda v: (v["price"], v["item_id"]))
+        if [v["item_id"] for v in wider] != [v["item_id"] for v in matches]:
+            result["items_in_stock_with_only_the_stated_options_cheapest_first"] = [row(v) for v in wider]
+    owned = _other_purchases(items, product_id, str(current_id) if current_id else None, product)
+    if owned:
+        result["other_items_of_this_product_the_customer_bought"] = owned
     result["reminders"] = SEARCH_REMINDERS
     return json.dumps(result)
 

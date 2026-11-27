@@ -112,7 +112,10 @@ def grade(point, text, calls):
     expected_prices = {f"{point['variants'][i]['price']:.2f}" for i in point["expected"]}
     if all(names(i) for i in point["expected"]):
         return "right"
-    others = [i for i in point["variants"] if i not in point["expected"] and f"{point['variants'][i]['price']:.2f}" not in expected_prices]
+    owned = {line.get("item_id") for _, text in rules.results_of(point["items"], rules.ORDER_TOOL) for line in ((json.loads(text).get("items") or [])
+                                                                                                 if text.startswith("{") else [])}
+    others = [i for i in point["variants"] if i not in point["expected"] and i not in owned  # naming an item the customer has is no offer
+              and f"{point['variants'][i]['price']:.2f}" not in expected_prices]
     if any(names(i) for i in others):
         return "wrong"
     return "unclear"

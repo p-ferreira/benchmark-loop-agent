@@ -1095,6 +1095,17 @@ class RetailRulesTests(Base):
         self.assertEqual([row["item_id"] for row in found["items_in_stock_that_match_cheapest_first"]], ["3"])  # size S kept
         self.assertEqual(found["searched_for"], {"color": "red", "size": "s"})
 
+    def test_a_narrowed_search_also_says_what_the_stated_options_alone_allow_and_what_else_the_customer_bought(self):
+        found = self.search(current_item_id="1", keep_other_options_of_current_item=True, required_options={"color": "red"})
+        self.assertEqual([row["item_id"] for row in found["items_in_stock_with_only_the_stated_options_cheapest_first"]], ["3", "4"])
+        self.assertNotIn("items_in_stock_with_only_the_stated_options_cheapest_first", self.search(required_options={"color": "red"}))
+        second = {"order_id": "#W2", "status": "delivered", "items": [{"name": "Mug", "product_id": "p1", "item_id": "5", "price": 11.0, "options": {}},
+                                                                      {"name": "Pen", "product_id": "p9", "item_id": "90", "price": 1.0, "options": {}}]}
+        items = self.ITEMS + read("get_order_details", second, "o2", order_id="#W2")
+        owned = self.search(items=items, current_item_id="1")["other_items_of_this_product_the_customer_bought"]
+        self.assertEqual(owned, [{"item_id": "5", "in_order": "#W2", "options": {}, "in_stock_now": True, "price_now": 12.0}])
+        self.assertNotIn("other_items_of_this_product_the_customer_bought", self.search(current_item_id="1"))  # only the current item was bought
+
     def test_a_choice_restricted_to_named_items_looks_only_at_them(self):
         found = self.search(only_among_item_ids=["5", "3", "999"])
         self.assertEqual([row["item_id"] for row in found["items_in_stock_that_match_cheapest_first"]], ["3", "5"])
