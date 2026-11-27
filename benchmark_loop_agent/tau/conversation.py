@@ -93,8 +93,8 @@ def run_attempt(config: Any, task: Any, seed: int, settings: Settings, environme
     if settings.handover_rule:  # whether the transfer tool was ever offered, and replies asked again for announcing one without it
         fields["agent_handover"] = {"offered": usage.handover_offered, "refused_replies": usage.handover_refusals,
                                     "announced_without_tool": usage.handover_announced}
-    if settings.rules:  # each reply held and asked again, by rule, and the address calls put in the database's form
-        fields["agent_rules"] = {"holds": list(usage.rule_holds), "address_corrections": usage.address_corrections}
+    if settings.rules:  # each reply held and asked again, by rule; the agent's own searches; address calls corrected
+        fields["agent_rules"] = usage.rules.record()
     conversation = {"messages": _messages(simulation, usage), "partial": partial, "reward_info": _reward_info(simulation),
                     "agent_call_usage": [call.to_dict() for call in usage.calls]}
     return {"fields": redact(fields, secrets), "conversation": redact(conversation, secrets)}

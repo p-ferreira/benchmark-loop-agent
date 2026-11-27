@@ -1036,66 +1036,129 @@ class HandoverRuleTests(Base):
         self.assertIn("- hand-over rule: on", build_report(self.directory, RATES_FILE))
 
 
+PRODUCT = {"name": "Mug", "product_id": "p1", "variants": {
+    "1": {"item_id": "1", "options": {"color": "blue", "size": "S"}, "available": False, "price": 1.0},
+    "2": {"item_id": "2", "options": {"color": "black", "size": "S"}, "available": True, "price": 7.25},
+    "3": {"item_id": "3", "options": {"color": "red", "size": "S"}, "available": True, "price": 9.5},
+    "4": {"item_id": "4", "options": {"color": "red", "size": "L"}, "available": True, "price": 9.5},
+    "5": {"item_id": "5", "options": {"color": "black", "size": "L"}, "available": True, "price": 12.0}}}
+ORDER = {"order_id": "#W1", "status": "pending", "items": [{"name": "Mug", "product_id": "p1", "item_id": "1", "price": 8.0,
+                                                           "options": {"color": "blue", "size": "S"}}]}
+
+
+def call(name, id="c1", **arguments):
+    return {"id": id, "name": name, "arguments": arguments}
+
+
+def read(tool, result, id, **arguments):
+    """A tool call and its result, as two kept items."""
+    return [{"role": "assistant", "text": "", "calls": [call(tool, id, **arguments)]},
+            {"role": "tool", "id": id, "text": result if isinstance(result, str) else json.dumps(result)}]
+
+
 class RetailRulesTests(Base):
     """``--rules``: retail rules in code (``tau/rules.py``)."""
+
+    ITEMS = [{"role": "user", "text": "I want another mug."}, *read("get_order_details", ORDER, "o1", order_id="#W1"),
+             *read("get_product_details", PRODUCT, "p1", product_id="p1")]
+
+    def search(self, items=None, **arguments):
+        return json.loads(tau_rules.search(self.ITEMS if items is None else items, {"product_id": "p1", **arguments}))
 
     def run_ruled(self, send, rules=tau_rules.RULES, completion=None, provider="openai"):
         parameters = RunParameters(provider, "agent-model", "gpt-6-sol", (TASK_ID,), 1, 300, None, 1, False, False, tuple(rules))
         with mock.patch.object(UP.llm_utils, "completion", completion or ScriptedLitellm(TASK)):
             return run_retail(self.directory, parameters, environment(provider), send)
 
-    @staticmethod
-    def call(name, **arguments):
-        return {"id": "c1", "name": name, "arguments": arguments}
+    # --- offers: the search
 
-    def test_address_fields_are_put_in_the_forms_of_the_database_and_nothing_else_is_touched(self):
-        fixed = tau_rules.fix_address(self.call("modify_user_address", user_id="u", address1="1 Road", address2="", city="New York",
-                                                state="New York", country="United States", zip="10001"))
-        self.assertEqual((fixed["arguments"]["state"], fixed["arguments"]["country"]), ("NY", "USA"))
-        self.assertEqual(fixed["arguments"]["city"], "New York")  # a city named as a state stays
-        for country in ("", "US", "usa", "U.S.A.", "United States of America"):
-            self.assertEqual(tau_rules.fix_address(self.call("modify_pending_order_address", order_id="#W1", state="tx",
-                                                             country=country))["arguments"], {"order_id": "#W1", "state": "TX", "country": "USA"})
-        right = self.call("modify_user_address", user_id="u", state="CO", country="USA")
-        self.assertIs(tau_rules.fix_address(right), right)
-        abroad = self.call("modify_user_address", user_id="u", state="Ontario", country="Canada")
-        self.assertIs(tau_rules.fix_address(abroad), abroad)  # not a form of the same value: left as the model wrote it
-        other = self.call("cancel_pending_order", order_id="#W1", reason="no longer needed", country="United States")
-        self.assertIs(tau_rules.fix_address(other), other)
+    def test_the_search_returns_only_items_in_stock_with_the_required_options_cheapest_first(self):
+        found = self.search(required_options={"Color": " RED "})
+        self.assertEqual([row["item_id"] for row in found["items_in_stock_that_match_cheapest_first"]], ["3", "4"])
+        self.assertEqual(found["cheapest_match"], {"tie_at_the_same_price": ["3", "4"]})  # a tie is said, not broken
+        everything = self.search()
+        self.assertEqual([row["item_id"] for row in everything["items_in_stock_that_match_cheapest_first"]], ["2", "3", "4", "5"])
+        self.assertEqual(everything["cheapest_match"], "2")
+        self.assertEqual(everything["searched_for"], "any item in stock")
 
-    def test_a_reply_asking_for_the_country_is_recognised_and_a_summary_stating_it_is_not(self):
-        self.assertTrue(tau_rules.asks_for_country("I still need the state and country before I can prepare the update.", []))
-        self.assertFalse(tau_rules.asks_for_country("New address: 1 Road, New York, NY 10001, USA. Country: USA. Confirm?", []))
-        self.assertFalse(tau_rules.asks_for_country("Which order would you like to change?", []))
-        self.assertFalse(tau_rules.asks_for_country("What country?", [self.call("get_user_details", user_id="u")]))
+    def test_price_differences_are_against_what_the_customer_paid_in_cents(self):
+        found = self.search(current_item_id="1", required_options={"color": "black"})
+        self.assertEqual(found["current_item"]["price_paid"], 8.0)  # the order's price, not the catalogue's 1.0
+        rows = {row["item_id"]: row["price_difference_against_current_item"] for row in found["items_in_stock_that_match_cheapest_first"]}
+        self.assertEqual(rows, {"2": "0.75 (refunded to the customer)", "5": "4.00 (the customer pays this much more)"})
+        no_order = self.search(items=self.ITEMS[:1] + self.ITEMS[3:], current_item_id="1", required_options={"color": "black", "size": "S"})
+        self.assertEqual(no_order["items_in_stock_that_match_cheapest_first"][0]["price_difference_against_current_item"],
+                         "6.25 (the customer pays this much more)")  # no order read: the catalogue's price of the current item
 
-    def test_a_product_is_shown_as_its_available_variants_cheapest_first(self):
-        product = {"name": "Mug", "product_id": "p1", "variants": {
-            "3": {"item_id": "3", "options": {"color": "red"}, "available": True, "price": 9.5},
-            "1": {"item_id": "1", "options": {"color": "blue"}, "available": False, "price": 1.0},
-            "2": {"item_id": "2", "options": {"color": "black"}, "available": True, "price": 7.25}}}
-        shown = json.loads(tau_rules.product_table(json.dumps(product)))
-        self.assertEqual([v["item_id"] for v in shown["available_variants_cheapest_first"]], ["2", "3"])
-        self.assertEqual(shown["available_variants_cheapest_first"][0], {"item_id": "2", "price": 7.25, "options": {"color": "black"}})
-        self.assertEqual(shown["unavailable_variants"], [{"item_id": "1", "price": 1.0, "options": {"color": "blue"}}])
-        self.assertEqual(tau_rules.product_table("Error: Product not found"), "Error: Product not found")
-        self.assertEqual(tau_rules.product_table('{"order_id": "#W1"}'), '{"order_id": "#W1"}')
-        items = [{"role": "assistant", "text": "", "calls": [self.call("get_product_details", product_id="p1"),
-                                                             {"id": "c2", "name": "get_order_details", "arguments": {}}]},
-                 {"role": "tool", "id": "c1", "text": json.dumps(product)}, {"role": "tool", "id": "c2", "text": json.dumps(product)}]
-        shown_items = tau_rules.shown_items(items)
-        self.assertIn("cheapest first", shown_items[1]["text"])
-        self.assertEqual(shown_items[2], items[2])  # only the product tool's results
-        self.assertEqual(items[1]["text"], json.dumps(product))  # the kept conversation is not changed
+    def test_the_same_item_except_for_one_option_keeps_every_other_option(self):
+        found = self.search(current_item_id="1", keep_other_options_of_current_item=True, required_options={"color": "red"})
+        self.assertEqual([row["item_id"] for row in found["items_in_stock_that_match_cheapest_first"]], ["3"])  # size S kept
+        self.assertEqual(found["searched_for"], {"color": "red", "size": "s"})
+
+    def test_a_choice_restricted_to_named_items_looks_only_at_them(self):
+        found = self.search(only_among_item_ids=["5", "3", "999"])
+        self.assertEqual([row["item_id"] for row in found["items_in_stock_that_match_cheapest_first"]], ["3", "5"])
+        self.assertEqual(found["cheapest_match"], "3")  # not item 2, the cheapest of the catalogue
+        self.assertEqual(found["of_those_not_variants_of_this_product"], ["999"])
+
+    def test_when_nothing_in_stock_matches_the_result_says_so_and_what_exists(self):
+        found = self.search(required_options={"color": "blue"})
+        self.assertIs(found["no_item_in_stock_matches"], True)
+        self.assertEqual(found["items_in_stock_that_match_cheapest_first"], [])
+        self.assertEqual(found["matching_items_out_of_stock"], ["1"])
+        self.assertEqual(found["values_in_stock_for_each_option"], {"color": ["black", "red"], "size": ["L", "S"]})
+        self.assertEqual(found["closest_items_in_stock"][0]["differs_from_what_was_asked_in"], {"color": "black"})
+        self.assertNotIn("cheapest_match", found)
+
+    def test_what_the_search_cannot_answer_is_an_error_that_says_what_to_do(self):
+        self.assertIn("get_product_details", self.search(items=self.ITEMS[:3])["error"])  # the product was never read
+        self.assertEqual(self.search(required_options={"weight": "1kg"})["option_names"], ["color", "size"])
+        self.assertIn("not a variant", self.search(current_item_id="77")["error"])
+        self.assertIn("must be an object", self.search(required_options="red")["error"])
+
+    def test_a_product_is_shown_without_its_variants_and_the_kept_conversation_is_not_changed(self):
+        shown = tau_rules.shown_items(self.ITEMS)
+        product = json.loads(shown[-1]["text"])
+        self.assertNotIn("variants", product)
+        self.assertEqual(product["option_values"], {"color": ["blue", "black", "red"], "size": ["S", "L"]})
+        self.assertEqual((product["variants_in_stock"], product["variants_in_all"]), (4, 5))
+        self.assertIn("find_replacement_items", product["note"])
+        self.assertEqual(shown[2], self.ITEMS[2])  # the order result is untouched
+        self.assertEqual(json.loads(self.ITEMS[-1]["text"]), PRODUCT)
+        self.assertEqual(tau_rules.product_summary("Error: Product not found"), "Error: Product not found")
+
+    def test_a_change_to_an_item_no_search_returned_is_named_and_one_to_a_returned_item_is_not(self):
+        change = [call("modify_pending_order_items", order_id="#W1", item_ids=["1"], new_item_ids=["3"], payment_method_id="paypal_1")]
+        self.assertIn("The new item 3 was not returned", tau_rules.unsearched_change(self.ITEMS, change))
+        searched = self.ITEMS + read("find_replacement_items", tau_rules.search(self.ITEMS, {"product_id": "p1", "required_options": {"color": "red"}}),
+                                     "s1", product_id="p1")
+        self.assertIsNone(tau_rules.unsearched_change(searched, change))
+        self.assertIn("5", tau_rules.unsearched_change(searched, [call("exchange_delivered_order_items", order_id="#W1", item_ids=["1", "1"],
+                                                                        new_item_ids=["3", "5"], payment_method_id="p")]))
+        self.assertIsNone(tau_rules.unsearched_change(self.ITEMS, [call("cancel_pending_order", order_id="#W1", reason="no longer needed")]))
+
+    # --- order-lock, payment, address, handover-once
+
+    def test_an_item_change_is_held_for_the_lock_only_when_the_customer_spoke_of_delivery_and_the_address_is_unchanged(self):
+        change = [call("modify_pending_order_items", order_id="#W1", item_ids=["1"], new_item_ids=["3"], payment_method_id="p")]
+        spoke = [{"role": "user", "text": "Swap the mug, and send it to my office instead."}]
+        self.assertIn("locks the order", tau_rules.locks_before_address(spoke, change))
+        self.assertIsNone(tau_rules.locks_before_address([{"role": "user", "text": "Swap the mug."}], change))
+        done = spoke + read("modify_pending_order_address", ORDER, "a1", order_id="#W1")
+        self.assertIsNone(tau_rules.locks_before_address(done, change))
+        failed = spoke + read("modify_pending_order_address", "Error: Non-pending order cannot be modified", "a1", order_id="#W1")
+        self.assertIsNotNone(tau_rules.locks_before_address(failed, change))
+        other = spoke + read("modify_pending_order_address", ORDER, "a1", order_id="#W2")
+        self.assertIsNotNone(tau_rules.locks_before_address(other, change))  # another order's address
+        self.assertIsNone(tau_rules.locks_before_address(spoke, [*change, call("modify_pending_order_address", "c2", order_id="#W1")]))
+        self.assertIsNone(tau_rules.locks_before_address(spoke, [call("exchange_delivered_order_items", order_id="#W1")]))
 
     def payment_items(self, methods, customer="Please swap the mug for the black one."):
-        return [{"role": "user", "text": customer},
-                {"role": "assistant", "text": "", "calls": [{"id": "u1", "name": "get_user_details", "arguments": {"user_id": "u"}}]},
-                {"role": "tool", "id": "u1", "text": json.dumps({"payment_methods": {name: {} for name in methods}})}]
+        return [{"role": "user", "text": customer}, *read("get_user_details", {"payment_methods": {name: {} for name in methods}}, "u1", user_id="u")]
 
     def test_an_item_change_is_held_only_when_several_methods_are_on_file_and_the_customer_named_none(self):
-        change = [self.call("modify_pending_order_items", order_id="#W1", item_ids=["1"], new_item_ids=["2"], payment_method_id="paypal_1")]
-        exchange = [self.call("exchange_delivered_order_items", order_id="#W1", item_ids=["1"], new_item_ids=["2"], payment_method_id="paypal_1")]
+        change = [call("modify_pending_order_items", order_id="#W1", item_ids=["1"], new_item_ids=["2"], payment_method_id="paypal_1")]
+        exchange = [call("exchange_delivered_order_items", order_id="#W1", item_ids=["1"], new_item_ids=["2"], payment_method_id="paypal_1")]
         two = ["paypal_1", "credit_card_2"]
         self.assertIn("which payment method", tau_rules.payment_not_chosen(self.payment_items(two), change))
         self.assertIsNotNone(tau_rules.payment_not_chosen(self.payment_items(two), exchange))
@@ -1103,56 +1166,148 @@ class RetailRulesTests(Base):
         self.assertIsNone(tau_rules.payment_not_chosen(self.payment_items(two, "Swap it and use my credit card."), change))
         self.assertIsNone(tau_rules.payment_not_chosen(self.payment_items(two, "Swap it, same payment method."), change))
         self.assertIsNone(tau_rules.payment_not_chosen([{"role": "user", "text": "Swap it."}], change))  # the customer's details were never read
-        self.assertIsNone(tau_rules.payment_not_chosen(self.payment_items(two), [self.call("cancel_pending_order", order_id="#W1")]))
-        self.assertIsNone(tau_rules.payment_not_chosen(self.payment_items(two), [self.call("return_delivered_order_items", order_id="#W1")]))
+        self.assertIsNone(tau_rules.payment_not_chosen(self.payment_items(two), [call("cancel_pending_order", order_id="#W1")]))
+        self.assertIsNone(tau_rules.payment_not_chosen(self.payment_items(two), [call("return_delivered_order_items", order_id="#W1")]))
+
+    def test_address_fields_are_put_in_the_forms_of_the_database_and_nothing_else_is_touched(self):
+        fixed = tau_rules.fix_address(call("modify_user_address", user_id="u", address1="1 Road", address2="", city="New York",
+                                           state="New York", country="United States", zip="10001"))
+        self.assertEqual((fixed["arguments"]["state"], fixed["arguments"]["country"]), ("NY", "USA"))
+        self.assertEqual(fixed["arguments"]["city"], "New York")  # a city named as a state stays
+        for country in ("", "US", "usa", "U.S.A.", "United States of America"):
+            self.assertEqual(tau_rules.fix_address(call("modify_pending_order_address", order_id="#W1", state="tx", country=country))["arguments"],
+                             {"order_id": "#W1", "state": "TX", "country": "USA"})
+        right = call("modify_user_address", user_id="u", state="CO", country="USA")
+        self.assertIs(tau_rules.fix_address(right), right)
+        abroad = call("modify_user_address", user_id="u", state="Ontario", country="Canada")
+        self.assertIs(tau_rules.fix_address(abroad), abroad)  # not a form of the same value: left as the model wrote it
+        other = call("cancel_pending_order", order_id="#W1", reason="no longer needed", country="United States")
+        self.assertIs(tau_rules.fix_address(other), other)
 
     def test_only_the_first_transfer_made_before_the_customer_asked_is_an_early_one(self):
-        transfer = [self.call("transfer_to_human_agents", summary="s")]
+        transfer = [call("transfer_to_human_agents", summary="s")]
         self.assertTrue(tau_rules.first_early_transfer([{"role": "user", "text": "hi"}], transfer, False))
         self.assertFalse(tau_rules.first_early_transfer([{"role": "user", "text": "a supervisor"}], transfer, True))
-        self.assertFalse(tau_rules.first_early_transfer([{"role": "user", "text": "hi"}], [self.call("get_user_details")], False))
+        self.assertFalse(tau_rules.first_early_transfer([{"role": "user", "text": "hi"}], [call("get_user_details")], False))
         self.assertFalse(tau_rules.first_early_transfer([{"role": "assistant", "text": "", "calls": transfer}], transfer, False))
 
-    def test_with_the_rules_on_and_nothing_to_step_in_on_the_requests_are_the_same(self):
+    # --- one turn under the rules
+
+    def scripted(self, replies):
+        """An ``ask`` that returns ``replies`` in order and keeps what it was sent."""
+        asked = []
+
+        def ask(items, tools):
+            asked.append((items, [t["function"]["name"] for t in tools]))
+            return replies[len(asked) - 1]
+
+        return ask, asked
+
+    def test_a_search_is_run_in_code_shown_to_the_model_and_never_sent_on_and_it_stays_in_later_turns(self):
+        state = tau_rules.RuleState()
+        searching = ("", [call("find_replacement_items", "s1", product_id="p1", required_options={"color": "red"})])
+        ask, asked = self.scripted([searching, ("Red comes in S and L, both $9.50.", [])])
+        text, calls = tau_rules.turn(("offers",), self.ITEMS, [], ask, state, False)
+        self.assertEqual((text, calls), ("Red comes in S and L, both $9.50.", []))
+        self.assertEqual(asked[0][1], ["find_replacement_items"])  # the agent's own tool is offered
+        self.assertNotIn("variants", json.loads(asked[0][0][-1]["text"]))  # the product is shown as its summary
+        self.assertEqual(asked[1][0][-2]["calls"][0]["name"], "find_replacement_items")
+        self.assertEqual([row["item_id"] for row in json.loads(asked[1][0][-1]["text"])["items_in_stock_that_match_cheapest_first"]], ["3", "4"])
+        self.assertEqual(state.record()["searches"][0]["arguments"], {"product_id": "p1", "required_options": {"color": "red"}})
+        later = self.ITEMS + [{"role": "assistant", "text": text, "calls": []}, {"role": "user", "text": "The small one."}]
+        merged = tau_rules.with_local(later, state)
+        self.assertEqual([item["role"] for item in merged[len(self.ITEMS):]], ["assistant", "tool", "assistant", "user"])  # where it happened
+        change = ("", [call("modify_pending_order_items", "w1", order_id="#W1", item_ids=["1"], new_item_ids=["3"], payment_method_id="p")])
+        ask, asked = self.scripted([change])
+        self.assertEqual(tau_rules.turn(("offers",), later, [], ask, state, False), change)  # item 3 was returned by the search: not held
+        self.assertEqual(state.holds, [])
+
+    def test_a_change_to_an_unsearched_item_is_held_at_most_twice_and_then_goes_through(self):
+        change = ("", [call("modify_pending_order_items", "w1", order_id="#W1", item_ids=["1"], new_item_ids=["5"], payment_method_id="p")])
+        state = tau_rules.RuleState()
+        ask, asked = self.scripted([change, change, change])
+        self.assertEqual(tau_rules.turn(("offers",), self.ITEMS, [], ask, state, False), change)
+        self.assertEqual(state.holds, ["unsearched", "unsearched"])
+        self.assertIn("was not returned by find_replacement_items", asked[1][0][-1]["text"])
+        self.assertEqual(asked[1][0][:-1], asked[0][0])  # the same conversation, plus the note
+
+    def test_one_hold_at_a_time_and_each_kind_once(self):
+        items = [{"role": "user", "text": "Swap the mug and ship it to my office."},
+                 *read("get_user_details", {"payment_methods": {"a": {}, "b": {}}}, "u1", user_id="u")]
+        change = ("", [call("modify_pending_order_items", "w1", order_id="#W1", item_ids=["1"], new_item_ids=["3"], payment_method_id="a")])
+        state = tau_rules.RuleState()
+        ask, asked = self.scripted([change, change, change])
+        self.assertEqual(tau_rules.turn(("order-lock", "payment"), items, [], ask, state, False), change)
+        self.assertEqual(state.holds, ["order-lock", "payment"])
+        ask, asked = self.scripted([change])
+        tau_rules.turn(("order-lock", "payment"), items, [], ask, state, False)
+        self.assertEqual(len(asked), 1)  # neither is asked a second time in the conversation
+
+    def test_an_early_transfer_is_refused_once_without_the_tool(self):
+        tools = [{"type": "function", "function": {"name": "transfer_to_human_agents"}}, {"type": "function", "function": {"name": "get_user_details"}}]
+        transfer = ("", [call("transfer_to_human_agents", summary="s")])
+        state = tau_rules.RuleState()
+        ask, asked = self.scripted([transfer, ("I cannot do that. Anything else?", [])])
+        self.assertEqual(tau_rules.turn(("handover-once",), [{"role": "user", "text": "Refund my lost tablet."}], tools, ask, state, False)[0],
+                         "I cannot do that. Anything else?")
+        self.assertEqual(asked[1][1], ["get_user_details"])
+        ask, asked = self.scripted([transfer])
+        self.assertEqual(tau_rules.turn(("handover-once",), [{"role": "user", "text": "Then nothing else."}], tools, ask, state, False), transfer)
+        ask, asked = self.scripted([transfer, transfer])
+        with self.assertRaises(tau_rules.RuleError):
+            tau_rules.turn(("handover-once",), [{"role": "user", "text": "hi"}], tools, ask, tau_rules.RuleState(), False)
+
+    def test_a_turn_that_keeps_searching_is_given_up(self):
+        searching = ("", [call("find_replacement_items", "s1", product_id="p1")])
+        ask, asked = self.scripted([searching] * 20)
+        with self.assertRaises(tau_rules.RuleError):
+            tau_rules.turn(("offers",), self.ITEMS, [], ask, tau_rules.RuleState(), False)
+        self.assertEqual(len(asked), tau_rules.MAX_ROUNDS + 1)
+
+    # --- in a run
+
+    def test_with_rules_on_and_nothing_to_step_in_on_the_requests_are_the_same(self):
         plain = ScriptedAgent(TASK)
         self.run_ruled(plain, rules=())
         self.directory = self.directory.parent / "ruled"
         ruled = ScriptedAgent(TASK)
-        records = self.run_ruled(ruled)
+        quiet = tuple(rule for rule in tau_rules.RULES if rule != "offers")  # the scripted agent changes items without a search
+        records = self.run_ruled(ruled, rules=quiet)
         self.assertEqual(records[0]["outcome"], "pass")
-        self.assertEqual([r["input"] for r in ruled.requests], [r["input"] for r in plain.requests])
-        self.assertEqual(self.records()[0]["agent_rules"], {"holds": [], "address_corrections": 0})
-        self.assertEqual(batch.read_manifest(self.directory)["parameters"]["rules"], sorted(tau_rules.RULES))
-        self.assertIn("rules in code: address, country, handover-once, payment, products",
+        self.assertEqual([(r["input"], r["tools"]) for r in ruled.requests], [(r["input"], r["tools"]) for r in plain.requests])
+        self.assertEqual(self.records()[0]["agent_rules"], {"holds": [], "address_corrections": 0, "searches": []})
+        self.assertEqual(batch.read_manifest(self.directory)["parameters"]["rules"], sorted(quiet))
+        self.assertIn("rules in code: address, handover-once, order-lock, payment",
                       build_report(self.directory, Path(__file__).resolve().parent.parent / "data" / "rates.json"))
+
+    def test_in_a_run_with_offers_the_search_tool_is_offered_and_an_unsearched_change_is_held_twice(self):
+        ruled = ScriptedAgent(TASK)
+        records = self.run_ruled(ruled, rules=("offers",))
+        self.assertEqual(records[0]["outcome"], "pass")  # the scripted agent repeats its call, which then goes through
+        self.assertEqual(self.records()[0]["agent_rules"]["holds"], ["unsearched", "unsearched"])
+        self.assertTrue(all(r["tools"][-1]["name"] == "find_replacement_items" for r in ruled.requests))
+        self.assertNotIn(tau_rules.HEADER, (self.directory / batch.CONVERSATIONS_FILE).read_text())  # the notes are not kept
 
     def test_a_run_without_rules_records_nothing_about_them(self):
         self.run_ruled(ScriptedAgent(TASK), rules=())
         self.assertNotIn("agent_rules", self.records()[0])
         self.assertNotIn("rules", batch.read_manifest(self.directory)["parameters"])
 
-    def test_an_early_transfer_is_refused_once_without_the_tool_and_the_note_is_not_kept(self):
+    def test_in_a_run_a_search_never_reaches_the_tools_and_the_record_keeps_it(self):
         requests = []
 
         def send(provider, api_key, request):
             requests.append(request)
-            last = request["input"][-1]
-            if last.get("role") == "user" and "Do not transfer in this reply" in last["content"]:
-                return openai_reply(text="I cannot do that under the policy. Is there anything else I can help with?")
-            if sum(1 for i in request["input"] if i.get("role") == "assistant") > 1:
+            if any(i.get("type") == "function_call_output" for i in request["input"]):
                 return openai_reply(text=FINAL_TEXT)
-            return openai_reply(calls=[("transfer_to_human_agents", {"summary": "wants a change"})])
+            return openai_reply(calls=[("find_replacement_items", {"product_id": "p-unread"})])
 
-        self.run_ruled(send, rules=("handover-once",))
-        self.assertEqual(self.records()[0]["agent_rules"]["holds"], ["handover-once"])
-        names = [[t["name"] for t in r["tools"]] for r in requests]
-        self.assertIn("transfer_to_human_agents", names[0])
-        self.assertNotIn("transfer_to_human_agents", names[1])  # the ask after the refusal cannot transfer
-        self.assertEqual(requests[1]["input"][:-1], requests[0]["input"])
-        self.assertIn("transfer_to_human_agents", names[2])  # from the next turn on the tool is back
-        self.assertNotIn(tau_rules.HEADER, json.dumps(requests[2]["input"]))  # the note is not kept
-        conversation = (self.directory / batch.CONVERSATIONS_FILE).read_text()
-        self.assertNotIn("transfer_to_human_agents", conversation)  # the refused call never reached the tools
+        self.run_ruled(send, rules=("offers",))
+        record = self.records()[0]
+        self.assertEqual(len(record["agent_rules"]["searches"]), 1)
+        self.assertIn("were not read", record["agent_rules"]["searches"][0]["result"]["error"])
+        self.assertNotIn("find_replacement_items", (self.directory / batch.CONVERSATIONS_FILE).read_text())  # upstream never saw the call
+        self.assertTrue(any(i.get("type") == "function_call" and i["name"] == "find_replacement_items" for i in requests[-1]["input"]))
 
     def test_an_address_call_reaches_the_tools_in_the_forms_of_the_database(self):
         def send(provider, api_key, request):
@@ -1162,10 +1317,11 @@ class RetailRulesTests(Base):
                                                                 "state": "New York", "country": "United States", "zip": "10001"})])
 
         self.run_ruled(send, rules=("address",))
-        self.assertEqual(self.records()[0]["agent_rules"], {"holds": [], "address_corrections": 1})
-        conversation = (self.directory / batch.CONVERSATIONS_FILE).read_text()
-        self.assertIn('"state": "NY", "country": "USA"', conversation)
+        self.assertEqual(self.records()[0]["agent_rules"]["address_corrections"], 1)
+        self.assertIn('"state": "NY", "country": "USA"', (self.directory / batch.CONVERSATIONS_FILE).read_text())
 
-    def test_the_names_of_the_rules_are_checked_by_the_command(self):
-        with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
-            main(["--output-dir", str(self.directory), "--provider", "openai", "--openai-model", "m", "--rules", "address,nope"])
+    def test_the_command_checks_the_names_and_refuses_the_older_options_beside_the_rules(self):
+        base = ["--output-dir", str(self.directory), "--provider", "openai", "--openai-model", "m", "--rules"]
+        for arguments in (base + ["address,nope"], base + ["address,address"], base + ["offers", "--finish-check"], base + ["offers", "--handover-rule"]):
+            with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+                main(arguments)

@@ -62,8 +62,7 @@ class AgentUsage:
     handover_offered: bool = False  # with ``--handover-rule``: the customer asked for a person, so the transfer tool was offered
     handover_refusals: int = 0  # with ``--handover-rule``: replies that announced a transfer without the tool and were asked again
     handover_announced: int = 0  # with ``--handover-rule``: replies that still announced one after the asks, and went to the customer
-    rule_holds: list[str] = field(default_factory=list)  # with ``--rules``: each reply held and asked again, by rule
-    address_corrections: int = 0  # with ``--rules address``: address calls whose country or state was put in the database's form
+    rules: Any = field(default_factory=retail_rules.RuleState)  # with ``--rules``: holds, the agent's own searches, corrections
 
     def totals(self) -> dict[str, int]:
         return {kind: sum(getattr(call, kind) for call in self.calls) for kind in TOKEN_KINDS}
@@ -424,8 +423,16 @@ def make_agent_class() -> type:
             system = state.system_messages[0].content  # upstream keeps exactly one: the system prompt
             self.usage.messages = state.messages
             items = _messages(state.messages)
-            # What the model is sent; the rules themselves read ``items``, the conversation as it is kept.
-            shown = retail_rules.shown_items(items) if "products" in self.rules else items
+            if self.rules:  # ``--rules``: the turn is run by the rules (searches of the agent's own, holds, corrections)
+                try:
+                    text, calls = retail_rules.turn(self.rules, items, tool_definitions(self.tools),
+                                                    lambda shown, tools: self._ask(system, shown, tools), self.usage.rules,
+                                                    customer_asked_for_a_person(items))
+                except retail_rules.RuleError as error:
+                    raise AgentCallError(str(error)) from None
+                return AssistantMessage(
+                    role="assistant", content=text or None,
+                    tool_calls=[ToolCall(id=c["id"], name=c["name"], arguments=c["arguments"]) for c in calls] or None)
             tools = tool_definitions(self.tools)
             withheld = False
             if self.handover_rule:
@@ -434,13 +441,13 @@ def make_agent_class() -> type:
                 else:
                     tools = [tool for tool in tools if tool["function"]["name"] != HANDOVER_TOOL]
                     withheld = True
-            text, calls = self._ask(system, shown, tools)
+            text, calls = self._ask(system, items, tools)
             if withheld:
                 for _ in range(HANDOVER_REASKS):
                     if not announces_handover(text, calls):
                         break
                     self.usage.handover_refusals += 1
-                    text, calls = self._ask(system, [*shown, {"role": "user", "text": HANDOVER_REFUSAL}], tools)
+                    text, calls = self._ask(system, [*items, {"role": "user", "text": HANDOVER_REFUSAL}], tools)
                 if any(call["name"] == HANDOVER_TOOL for call in calls):
                     raise AgentCallError("the model called the transfer tool, which was not among the tools it was sent")
                 if announces_handover(text, calls):
@@ -449,35 +456,10 @@ def make_agent_class() -> type:
                 held = check_note(items, text, calls, write_tool_names(self.tools), self.usage)
                 if held is not None:
                     self.usage.checks.append(held[0])
-                    text, calls = self._ask(system, [*shown, {"role": "user", "text": held[1]}], tools)
-            if self.rules:
-                text, calls = self._apply_rules(system, items, shown, tools, text, calls)
+                    text, calls = self._ask(system, [*items, {"role": "user", "text": held[1]}], tools)
             return AssistantMessage(
                 role="assistant", content=text or None,
                 tool_calls=[ToolCall(id=c["id"], name=c["name"], arguments=c["arguments"]) for c in calls] or None)
-
-        def _apply_rules(self, system: str, items: list[dict[str, Any]], shown: list[dict[str, Any]], tools: list[dict[str, Any]],
-                         text: str, calls: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
-            """``--rules``: at most one hold of this reply (each kind once in a conversation), then the address forms."""
-            held: tuple[str, str] | None = None
-            if ("handover-once" in self.rules and "handover-once" not in self.usage.rule_holds
-                    and retail_rules.first_early_transfer(items, calls, customer_asked_for_a_person(items))):
-                held = "handover-once", retail_rules.HANDOVER_ONCE_NOTE
-                tools = [tool for tool in tools if tool["function"]["name"] != HANDOVER_TOOL]
-            elif "payment" in self.rules and "payment" not in self.usage.rule_holds and retail_rules.payment_not_chosen(items, calls):
-                held = "payment", retail_rules.payment_not_chosen(items, calls)
-            elif "country" in self.rules and "country" not in self.usage.rule_holds and retail_rules.asks_for_country(text, calls):
-                held = "country", retail_rules.COUNTRY_NOTE.format(held=json.dumps(text, ensure_ascii=False))
-            if held is not None:
-                self.usage.rule_holds.append(held[0])
-                text, calls = self._ask(system, [*shown, {"role": "user", "text": held[1]}], tools)
-                if held[0] == "handover-once" and any(call["name"] == HANDOVER_TOOL for call in calls):
-                    raise AgentCallError("the model called the transfer tool, which was not among the tools it was sent")
-            if "address" in self.rules:
-                fixed = [retail_rules.fix_address(call) for call in calls]
-                self.usage.address_corrections += sum(1 for before, after in zip(calls, fixed) if after is not before)
-                calls = fixed
-            return text, calls
 
         def _ask(self, system: str, items: list[dict[str, Any]], tools: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
             """One model call: its text and tool calls; its tokens are added to the attempt's usage."""

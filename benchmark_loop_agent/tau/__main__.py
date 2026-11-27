@@ -56,6 +56,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     chosen_rules = tuple(name.strip() for name in args.rules.split(",") if name.strip())
     if set(chosen_rules) - set(RULES) or len(set(chosen_rules)) != len(chosen_rules):
         parser.error(f"--rules takes distinct names among: {', '.join(RULES)}")
+    if chosen_rules and (args.finish_check or args.handover_rule):
+        parser.error("--rules cannot be combined with --finish-check or --handover-rule")
     if args.report is not None:
         try:
             print(build_report(args.report, args.rates), end="")

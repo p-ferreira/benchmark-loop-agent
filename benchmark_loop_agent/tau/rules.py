@@ -1,16 +1,19 @@
-"""Retail rules in code (``--rules``): what the model is shown, what is corrected, what is held and asked again.
+"""Retail rules in code (``--rules``): code builds the offer, checks a change before it runs, and refuses one early transfer.
 
-Off by default. Each rule is fitted to the retail policy, the tools and the kinds of failure seen in recorded
+Off by default. The rules are fitted to the retail policy, the tools and the kinds of failure seen in recorded
 conversations of a cheap model; none reads the task, an expected action or a score. They are pure functions
-over the conversation as the agent keeps it (``items``: role, text, calls), so that where each one steps in
-can be counted on recorded conversations without a model call.
+over the conversation as the agent keeps it (``items``: role, text, calls; tool results by call id), so that
+they can be run on recorded conversations.
 
-``address``       address fields of a write call are put in the database's forms ("USA", two-letter state).
-``country``       a reply that asks the customer for the country is held once: every address in the store is in the USA.
-``products``      the result of ``get_product_details`` is shown with the available variants cheapest first and the
-                  unavailable ones apart.
+``offers``        the model no longer reads a product's variants itself. ``get_product_details`` is shown as a
+                  summary without the variants, and a tool of the agent's own, ``find_replacement_items``, searches
+                  them in code: availability, the options the customer requires, prices and price differences,
+                  cheapest first. A change or exchange to an item that no search returned is held.
+``order-lock``    an item change of a pending order is held once when the customer spoke of a delivery address and
+                  that order's address was not changed: the item change locks the order.
 ``payment``       an item change or exchange is held once when the customer has several payment methods on file and
                   has named none: the model is told to ask which one takes the price difference.
+``address``       address fields of a write call are put in the database's forms ("USA", two-letter state).
 ``handover-once`` the first transfer of a conversation, made before the customer asked for a person, is refused
                   once: the model must say what it cannot do and ask whether there is anything else.
 """
@@ -19,8 +22,269 @@ import json
 import re
 from typing import Any
 
-RULES = ("address", "country", "products", "payment", "handover-once")
+RULES = ("offers", "order-lock", "payment", "address", "handover-once")
 HEADER = "Check by the system. This is not a message from the customer, and the customer does not see it."
+Items = list[dict[str, Any]]
+Calls = list[dict[str, Any]]
+
+
+def results_of(items: Items, tool: str) -> list[tuple[dict[str, Any], str]]:
+    """Each call to ``tool`` so far with the text of its result, in order."""
+    calls = {call["id"]: call for item in items if item["role"] == "assistant" for call in item["calls"] if call["name"] == tool}
+    return [(calls[item["id"]], item["text"]) for item in items if item["role"] == "tool" and item["id"] in calls]
+
+
+def _json(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+def _held(call: dict[str, Any]) -> str:
+    return json.dumps({"name": call["name"], "arguments": call["arguments"]}, ensure_ascii=False)
+
+
+# --- offers -----------------------------------------------------------------------------------
+
+PRODUCT_TOOL = "get_product_details"
+ORDER_TOOL = "get_order_details"
+SEARCH_TOOL = "find_replacement_items"
+ITEM_CHANGES = {"modify_pending_order_items", "exchange_delivered_order_items"}
+SEARCH_SCHEMA = {"type": "function", "function": {
+    "name": SEARCH_TOOL,
+    "description": (
+        "Search the variants of one product for the items the customer can get, exactly: only items in stock, only items "
+        "with every option the customer requires, with each price and the price difference against the customer's current "
+        "item, cheapest first. Always use it to choose or price the new item of an item change or an exchange, and to answer "
+        "which options or which cheapest item exist; do not work these out yourself. Call get_product_details for the "
+        "product first. A change or exchange to an item this search did not return is refused."),
+    "parameters": {"type": "object", "required": ["product_id"], "properties": {
+        "product_id": {"type": "string", "description": "The product id (not an item id), as in the order's item."},
+        "required_options": {"type": "object", "additionalProperties": {"type": "string"},
+                             "description": "Only the options the customer requires, by option name, such as {\"color\": \"red\"}. "
+                                            "Leave an option out when the customer did not ask for a value of it."},
+        "current_item_id": {"type": "string", "description": "The item the customer has now and wants replaced, when there is one: "
+                                                             "price differences are computed against it."},
+        "keep_other_options_of_current_item": {"type": "boolean",
+                                               "description": "True when the customer wants the same item except for the required "
+                                                              "options: every other option must equal the current item's."},
+        "only_among_item_ids": {"type": "array", "items": {"type": "string"},
+                                "description": "When the customer restricts the choice to particular items (for example the other "
+                                               "items of an order), their item ids; the search then looks only at these."}}}}}
+SEARCH_REMINDERS = (
+    "Present these to the customer as they are. Before the change: all items of one order that the customer wants changed "
+    "go in ONE call; an item change locks a pending order, so change its address or payment method first if the customer "
+    "asked for that; ask the customer which payment method takes the price difference unless they already said.")
+SUMMARY_NOTE = (f"The variants are not listed here. To choose, compare or price items of this product, call {SEARCH_TOOL}: "
+                "it searches the variants exactly.")
+UNSEARCHED_NOTE = (
+    HEADER + " You were about to make this call: {held}\n"
+    "The new item {missing} was not returned by " + SEARCH_TOOL + " in this conversation, so the call is refused. Call "
+    + SEARCH_TOOL + " with what the customer requires, tell the customer what it returns, and make the change with an item "
+    "it returned once the customer confirms.")
+UNSEARCHED_HOLDS = 2
+
+
+def _norm(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value)).strip().lower()
+
+
+def products_read(items: Items) -> dict[str, dict[str, Any]]:
+    """Each product whose details a tool result returned, by product id (the latest result wins)."""
+    products: dict[str, dict[str, Any]] = {}
+    for _, text in results_of(items, PRODUCT_TOOL):
+        product = _json(text)
+        if isinstance(product, dict) and isinstance(product.get("variants"), dict) and "product_id" in product:
+            products[str(product["product_id"])] = product
+    return products
+
+
+def product_summary(text: str) -> str:
+    """A product result as the model is shown it: no variants, the values each option takes, and where to search."""
+    product = _json(text)
+    try:
+        variants = list(product["variants"].values())
+        values: dict[str, list[str]] = {}
+        for variant in variants:
+            for name, value in variant["options"].items():
+                if value not in values.setdefault(name, []):
+                    values[name].append(value)
+        shown = {"name": product["name"], "product_id": product["product_id"], "note": SUMMARY_NOTE, "option_values": values,
+                 "variants_in_stock": sum(1 for v in variants if v["available"]), "variants_in_all": len(variants)}
+    except (KeyError, TypeError, AttributeError):
+        return text
+    return json.dumps(shown)
+
+
+def shown_items(items: Items) -> Items:
+    """``items`` as the model is sent them: product results as the summary."""
+    product_calls = {call["id"] for item in items if item["role"] == "assistant" for call in item["calls"] if call["name"] == PRODUCT_TOOL}
+    return [{**item, "text": product_summary(item["text"])} if item["role"] == "tool" and item["id"] in product_calls else item
+            for item in items]
+
+
+def _purchase_price(items: Items, item_id: str) -> float | None:
+    """What the customer paid for ``item_id``, from an order result; ``None`` when no order read holds it."""
+    for _, text in reversed(results_of(items, ORDER_TOOL)):
+        order = _json(text)
+        for line in (order.get("items") or []) if isinstance(order, dict) else []:
+            if isinstance(line, dict) and line.get("item_id") == item_id and isinstance(line.get("price"), (int, float)):
+                return float(line["price"])
+    return None
+
+
+def _difference(new: float, old: float | None) -> str | None:
+    if old is None:
+        return None
+    cents = round(new * 100) - round(old * 100)
+    if cents == 0:
+        return "0.00 (same price)"
+    return f"{abs(cents) / 100:.2f} ({'the customer pays this much more' if cents > 0 else 'refunded to the customer'})"
+
+
+def search(items: Items, arguments: dict[str, Any]) -> str:
+    """The result of ``find_replacement_items``: computed from the product result already in the conversation."""
+    product_id = str(arguments.get("product_id") or "")
+    product = products_read(items).get(product_id)
+    if product is None:
+        return json.dumps({"error": f"The details of product {product_id or '(none given)'} were not read in this conversation. "
+                                    f"Call {PRODUCT_TOOL} with the product id first (a product id, not an item id), then search again."})
+    variants = [v for v in product["variants"].values() if isinstance(v, dict) and isinstance(v.get("options"), dict)]
+    names = {_norm(name): name for v in variants for name in v["options"]}
+    required = arguments.get("required_options") or {}
+    if not isinstance(required, dict):
+        return json.dumps({"error": "required_options must be an object of option name to value."})
+    unknown = [name for name in required if _norm(name) not in names]
+    if unknown:
+        return json.dumps({"error": f"This product has no option named {', '.join(map(str, unknown))}.", "option_names": sorted(names.values())})
+    wanted = {names[_norm(name)]: _norm(value) for name, value in required.items()}
+    current_id = arguments.get("current_item_id")
+    current = product["variants"].get(str(current_id)) if current_id else None
+    if current_id and current is None:
+        return json.dumps({"error": f"Item {current_id} is not a variant of product {product_id}. Check the item id and the product id "
+                                    "in the order."})
+    if current is not None and arguments.get("keep_other_options_of_current_item"):
+        wanted = {**{name: _norm(value) for name, value in current["options"].items()}, **wanted}
+    among = arguments.get("only_among_item_ids")
+    among = {str(i) for i in among} if isinstance(among, list) and among else None
+    pool = variants if among is None else [v for v in variants if v.get("item_id") in among]
+    old = None
+    if current is not None:
+        paid = _purchase_price(items, str(current_id))
+        old = paid if paid is not None else float(current["price"])
+
+    def row(variant: dict[str, Any]) -> dict[str, Any]:
+        shown = {"item_id": variant["item_id"], "options": variant["options"], "price": variant["price"]}
+        difference = _difference(float(variant["price"]), old)
+        if difference is not None:
+            shown["price_difference_against_current_item"] = difference
+        return shown
+
+    def misses(variant: dict[str, Any]) -> dict[str, Any]:
+        return {name: variant["options"].get(name) for name, value in wanted.items() if _norm(variant["options"].get(name)) != value}
+
+    in_stock = [v for v in pool if v.get("available")]
+    matches = sorted((v for v in in_stock if not misses(v)), key=lambda v: (v["price"], v["item_id"]))
+    result: dict[str, Any] = {"product": product.get("name"), "product_id": product_id, "searched_for": wanted or "any item in stock"}
+    if current is not None:
+        result["current_item"] = {"item_id": current["item_id"], "options": current["options"], "price_paid": old}
+    if among is not None:
+        result["only_among_item_ids"] = sorted(among)
+        result["of_those_not_variants_of_this_product"] = sorted(among - {v.get("item_id") for v in variants})
+    result["items_in_stock_that_match_cheapest_first"] = [row(v) for v in matches]
+    if matches:
+        cheapest = [v["item_id"] for v in matches if v["price"] == matches[0]["price"]]
+        result["cheapest_match"] = cheapest[0] if len(cheapest) == 1 else {"tie_at_the_same_price": cheapest}
+    else:
+        result["no_item_in_stock_matches"] = True
+        result["matching_items_out_of_stock"] = [v["item_id"] for v in pool if not v.get("available") and not misses(v)]
+        nearest = sorted(in_stock, key=lambda v: (len(misses(v)), v["price"], v["item_id"]))[:5]
+        result["closest_items_in_stock"] = [{**row(v), "differs_from_what_was_asked_in": misses(v)} for v in nearest]
+        result["values_in_stock_for_each_option"] = {name: sorted({v["options"][name] for v in in_stock if name in v["options"]})
+                                                     for name in sorted(names.values())}
+    result["reminders"] = SEARCH_REMINDERS
+    return json.dumps(result)
+
+
+def offered_item_ids(items: Items) -> set[str]:
+    """Every item a search of this conversation returned as a match."""
+    offered: set[str] = set()
+    for _, text in results_of(items, SEARCH_TOOL):
+        result = _json(text)
+        for row in (result.get("items_in_stock_that_match_cheapest_first") or []) if isinstance(result, dict) else []:
+            offered.add(str(row.get("item_id")))
+    return offered
+
+
+def unsearched_change(items: Items, calls: Calls) -> str | None:
+    """The note, when this reply changes or exchanges to an item that no search of the conversation returned."""
+    offered = offered_item_ids(items)
+    for call in calls:
+        new = call["arguments"].get("new_item_ids")
+        if call["name"] not in ITEM_CHANGES or not isinstance(new, list):
+            continue
+        missing = [str(item) for item in new if str(item) not in offered]
+        if missing:
+            return UNSEARCHED_NOTE.format(held=_held(call), missing=", ".join(missing))
+    return None
+
+
+# --- order-lock -------------------------------------------------------------------------------
+
+PENDING_CHANGE = "modify_pending_order_items"
+ORDER_ADDRESS = "modify_pending_order_address"
+SPEAKS_OF_DELIVERY = re.compile(r"\b(address|ship(ped|ping|ment|s)?|deliver(ed|y|ing)?|redirect|send (it|them|this|that|the)|sent to)\b", re.IGNORECASE)
+LOCK_NOTE = (
+    HEADER + " You were about to make this call: {held}\n"
+    "It locks the order: afterwards its shipping address and payment method cannot be changed, its items cannot be changed "
+    "again and it cannot be cancelled. The customer has spoken of a delivery address in this conversation, and the address "
+    "of this order has not been changed. If the customer still wants this order sent to another address, make that change "
+    "first, with their confirmation. If they do not, or said to leave the address as it is, make the same call again.")
+
+
+def locks_before_address(items: Items, calls: Calls) -> str | None:
+    """The note, when an item change of a pending order comes while the customer spoke of delivery and its address is unchanged."""
+    change = next((call for call in calls if call["name"] == PENDING_CHANGE), None)
+    if change is None or not any(item["role"] == "user" and SPEAKS_OF_DELIVERY.search(item["text"]) for item in items):
+        return None
+    order = change["arguments"].get("order_id")
+    changed = any(call["arguments"].get("order_id") == order and not text.startswith("Error") for call, text in results_of(items, ORDER_ADDRESS))
+    same_reply = any(call["name"] == ORDER_ADDRESS and call["arguments"].get("order_id") == order for call in calls)
+    return None if changed or same_reply else LOCK_NOTE.format(held=_held(change))
+
+
+# --- payment ----------------------------------------------------------------------------------
+
+USER_TOOL = "get_user_details"
+NAMES_A_PAYMENT = re.compile(r"paypal|credit card|gift card|\bcard\b|original (payment|method)|same (payment|method|card)|payment method",
+                             re.IGNORECASE)
+PAYMENT_NOTE = (
+    HEADER + " You were about to make this call: {held}\n"
+    "The policy says the customer must provide the payment method that pays or receives the price difference. This "
+    "customer has more than one payment method on file and has not named one in this conversation. Do not make the "
+    "call yet: ask the customer which payment method to use for the price difference, naming the ones on file, and "
+    "make the call with their answer.")
+
+
+def payment_methods_on_file(items: Items) -> int:
+    """How many payment methods the customer's details showed, from the last ``get_user_details`` result; 0 when none was read."""
+    for _, text in reversed(results_of(items, USER_TOOL)):
+        user = _json(text)
+        methods = user.get("payment_methods") if isinstance(user, dict) else None
+        return len(methods) if isinstance(methods, dict) else 0
+    return 0
+
+
+def payment_not_chosen(items: Items, calls: Calls) -> str | None:
+    """The note, when this reply changes or exchanges items and the customer, with several methods on file, named none."""
+    change = next((call for call in calls if call["name"] in ITEM_CHANGES), None)
+    if change is None or payment_methods_on_file(items) < 2:
+        return None
+    if any(item["role"] == "user" and NAMES_A_PAYMENT.search(item["text"]) for item in items):
+        return None
+    return PAYMENT_NOTE.format(held=_held(change))
+
 
 # --- address ----------------------------------------------------------------------------------
 
@@ -37,12 +301,6 @@ STATES = {
     "tennessee": "TN", "texas": "TX", "utah": "UT", "vermont": "VT", "virginia": "VA", "washington": "WA",
     "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
 }
-ASKS_COUNTRY = re.compile(r"\bcountry\b", re.IGNORECASE)
-COUNTRY_NOTE = (
-    HEADER + " You were about to send this reply: {held}\n"
-    "Do not ask the customer for the country: every address in this store is in the USA, so use \"USA\". Do not ask "
-    "for the state when the city and ZIP code are given: work out its two-letter form from them. Continue with what "
-    "the customer gave you, and ask only for something you still cannot work out.")
 
 
 def fix_address(call: dict[str, Any]) -> dict[str, Any]:
@@ -61,82 +319,6 @@ def fix_address(call: dict[str, Any]) -> dict[str, Any]:
     return call if arguments == call["arguments"] else {**call, "arguments": arguments}
 
 
-def asks_for_country(text: str, calls: list[dict[str, Any]]) -> bool:
-    """A reply to the customer, with no call, that asks about the country."""
-    return not calls and bool(text) and bool(ASKS_COUNTRY.search(text)) and not said_country_is_set(text)
-
-
-def said_country_is_set(text: str) -> bool:
-    """The reply states the country (in a summary for confirmation) and does not ask for it."""
-    return bool(re.search(r"\b(USA|United States)\b", text))
-
-
-# --- products ---------------------------------------------------------------------------------
-
-PRODUCT_TOOL = "get_product_details"
-PRODUCT_NOTE = ("Shown by the system: the variants that can be ordered, cheapest first; unavailable_variants cannot be ordered "
-                "(an item the customer already has may be among them).")
-
-
-def product_table(text: str) -> str:
-    """The product's details with the available variants sorted by price; the text unchanged when it is not a product."""
-    try:
-        product = json.loads(text)
-        variants = list(product["variants"].values())
-        available = sorted((v for v in variants if v["available"]), key=lambda v: (v["price"], v["item_id"]))
-        shown = {"name": product["name"], "product_id": product["product_id"], "note": PRODUCT_NOTE,
-                 "available_variants_cheapest_first": [{"item_id": v["item_id"], "price": v["price"], "options": v["options"]}
-                                                       for v in available],
-                 "unavailable_variants": [{"item_id": v["item_id"], "price": v["price"], "options": v["options"]}
-                                          for v in sorted((v for v in variants if not v["available"]), key=lambda v: v["item_id"])]}
-    except (ValueError, KeyError, TypeError, AttributeError):
-        return text
-    return json.dumps(shown)
-
-
-def shown_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """``items`` as the model is shown them: product results as the table."""
-    product_calls = {call["id"] for item in items if item["role"] == "assistant" for call in item["calls"] if call["name"] == PRODUCT_TOOL}
-    return [{**item, "text": product_table(item["text"])} if item["role"] == "tool" and item["id"] in product_calls else item
-            for item in items]
-
-
-# --- payment ----------------------------------------------------------------------------------
-
-ITEM_CHANGES = {"modify_pending_order_items", "exchange_delivered_order_items"}
-USER_TOOL = "get_user_details"
-NAMES_A_PAYMENT = re.compile(r"paypal|credit card|gift card|\bcard\b|original (payment|method)|same (payment|method|card)|payment method",
-                             re.IGNORECASE)
-PAYMENT_NOTE = (
-    HEADER + " You were about to make this call: {held}\n"
-    "The policy says the customer must provide the payment method that pays or receives the price difference. This "
-    "customer has more than one payment method on file and has not named one in this conversation. Do not make the "
-    "call yet: ask the customer which payment method to use for the price difference, naming the ones on file, and "
-    "make the call with their answer.")
-
-
-def payment_methods_on_file(items: list[dict[str, Any]]) -> int:
-    """How many payment methods the customer's details showed, from the last ``get_user_details`` result; 0 when none was read."""
-    user_calls = {call["id"] for item in items if item["role"] == "assistant" for call in item["calls"] if call["name"] == USER_TOOL}
-    for item in reversed(items):
-        if item["role"] == "tool" and item["id"] in user_calls:
-            try:
-                return len(json.loads(item["text"])["payment_methods"])
-            except (ValueError, KeyError, TypeError):
-                return 0
-    return 0
-
-
-def payment_not_chosen(items: list[dict[str, Any]], calls: list[dict[str, Any]]) -> str | None:
-    """The note, when this reply changes or exchanges items and the customer, with several methods on file, named none."""
-    change = next((call for call in calls if call["name"] in ITEM_CHANGES), None)
-    if change is None or payment_methods_on_file(items) < 2:
-        return None
-    if any(item["role"] == "user" and NAMES_A_PAYMENT.search(item["text"]) for item in items):
-        return None
-    return PAYMENT_NOTE.format(held=json.dumps({"name": change["name"], "arguments": change["arguments"]}, ensure_ascii=False))
-
-
 # --- handover-once ----------------------------------------------------------------------------
 
 HANDOVER_TOOL = "transfer_to_human_agents"
@@ -147,8 +329,102 @@ HANDOVER_ONCE_NOTE = (
     "anything else you can help with. If the customer then still needs something outside your tools, you can transfer.")
 
 
-def first_early_transfer(items: list[dict[str, Any]], calls: list[dict[str, Any]], asked_for_a_person: bool) -> bool:
+def first_early_transfer(items: Items, calls: Calls, asked_for_a_person: bool) -> bool:
     """This reply makes the conversation's first transfer, and the customer has not asked for a person."""
     if asked_for_a_person or not any(call["name"] == HANDOVER_TOOL for call in calls):
         return False
     return not any(call["name"] == HANDOVER_TOOL for item in items if item["role"] == "assistant" for call in item["calls"])
+
+
+# --- one turn of the agent under the rules ------------------------------------------------------
+
+MAX_ROUNDS = 8  # searches and holds in one turn before the turn is given up as unscored
+
+
+class RuleError(Exception):
+    """The turn did not settle under the rules: the conversation is unscored."""
+
+
+class RuleState:
+    """What the rules keep over one conversation."""
+
+    def __init__(self) -> None:
+        self.holds: list[str] = []  # each reply held and asked again, by rule
+        self.local: list[tuple[int, Items]] = []  # searches the agent ran itself: (how many kept items came before, the call and its result)
+        self.searches: list[dict[str, Any]] = []  # each search: its arguments and its result, for the record
+        self.address_corrections = 0
+
+    def record(self) -> dict[str, Any]:
+        return {"holds": list(self.holds), "address_corrections": self.address_corrections, "searches": list(self.searches)}
+
+
+def with_local(base: Items, state: RuleState) -> Items:
+    """The kept conversation with the agent's own searches put back where they happened."""
+    merged: Items = []
+    for position in range(len(base) + 1):
+        for anchor, entry in state.local:
+            if anchor == position:
+                merged.extend(entry)
+        if position < len(base):
+            merged.append(base[position])
+    return merged
+
+
+def _hold(rules: tuple[str, ...], items: Items, calls: Calls, state: RuleState, asked_for_a_person: bool) -> tuple[str, str] | None:
+    """Which rule holds this reply, and its note: one at a time, each kind a limited number of times in a conversation."""
+    if "handover-once" in rules and "handover-once" not in state.holds and first_early_transfer(items, calls, asked_for_a_person):
+        return "handover-once", HANDOVER_ONCE_NOTE
+    if "offers" in rules and state.holds.count("unsearched") < UNSEARCHED_HOLDS:
+        note = unsearched_change(items, calls)
+        if note:
+            return "unsearched", note
+    if "order-lock" in rules and "order-lock" not in state.holds:
+        note = locks_before_address(items, calls)
+        if note:
+            return "order-lock", note
+    if "payment" in rules and "payment" not in state.holds:
+        note = payment_not_chosen(items, calls)
+        if note:
+            return "payment", note
+    return None
+
+
+def turn(rules: tuple[str, ...], base: Items, tools: list[dict[str, Any]], ask: Any, state: RuleState,
+         asked_for_a_person: bool) -> tuple[str, Calls]:
+    """The agent's reply to the conversation ``base`` under the rules. ``ask(items, tools)`` is one model call."""
+    offers = "offers" in rules
+    if offers:
+        tools = [*tools, SEARCH_SCHEMA]
+    items = with_local(base, state)
+
+    def shown() -> Items:
+        return shown_items(items) if offers else items
+
+    text, calls = ask(shown(), tools)
+    for _ in range(MAX_ROUNDS):
+        local = [call for call in calls if call["name"] == SEARCH_TOOL]
+        if local:  # the agent's own tool: run here, kept with the conversation, never sent on
+            entry: Items = [{"role": "assistant", "text": text, "calls": local}]
+            for call in local:
+                result = search(items, call["arguments"])
+                state.searches.append({"arguments": call["arguments"], "result": _json(result)})
+                entry.append({"role": "tool", "id": call["id"], "text": result})
+            state.local.append((len(base), entry))
+            items = items + entry
+            text, calls = ask(shown(), tools)
+            continue
+        held = _hold(rules, items, calls, state, asked_for_a_person)
+        if held is None:
+            break
+        state.holds.append(held[0])
+        offered = [t for t in tools if t["function"]["name"] != HANDOVER_TOOL] if held[0] == "handover-once" else tools
+        text, calls = ask([*shown(), {"role": "user", "text": held[1]}], offered)
+        if held[0] == "handover-once" and any(call["name"] == HANDOVER_TOOL for call in calls):
+            raise RuleError("the model called the transfer tool, which was not among the tools it was sent")
+    else:
+        raise RuleError(f"the turn did not settle in {MAX_ROUNDS} rounds of searches and checks")
+    if "address" in rules:
+        fixed = [fix_address(call) for call in calls]
+        state.address_corrections += sum(1 for before, after in zip(calls, fixed) if after is not before)
+        calls = fixed
+    return text, calls
