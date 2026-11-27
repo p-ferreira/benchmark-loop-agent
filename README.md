@@ -582,6 +582,19 @@ nothing of the task. `run.json` records `handover_rule: true`, each record says 
 was ever offered and how many replies were asked again, and the report says the rule was on. Without the option
 nothing changes.
 
+**Retail rules in code (`--rules NAMES`, off by default).** A comma-separated choice among `offers`, `order-lock`,
+`payment`, `address` and `handover-once` (`benchmark_loop_agent/tau/rules.py`). With `offers` the model is shown a
+product without its variants and searches them through a tool the agent runs itself, `find_replacement_items`: items
+in stock, the options the customer requires, prices and price differences, computed in code; a change to an item no
+search returned, or of an item for itself, is held and the model is asked again. The other rules hold an item change
+that would lock an order before its address change, or whose payment method the customer never chose; put address
+fields in the database's forms and look the state up from the ZIP code; and refuse the first transfer made before the
+customer asked for a person. No rule reads the task or the score. Each record's `agent_rules` holds the searches, the
+holds and the corrections. `--rules` cannot be combined with `--finish-check` or `--handover-rule`. Results:
+`results/phase-2/tau-retail-rules/`.
+
+**The other retail tasks (`--unseen`).** Runs the 64 tasks of upstream's base split that are outside `retail_50`.
+
 **The task set.** `retail_50.json` must hash to the digest written in `benchmark_loop_agent/tau/upstream.py` **and** to the
 one upstream's manifest records for the subset (`dc7490f0…f2be`), and the 50 task identifiers are read from those very
 bytes; any other file is refused before any request. Upstream's own checks (its frozen-subset digest, that the canonical
