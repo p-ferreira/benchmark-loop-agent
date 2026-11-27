@@ -147,6 +147,7 @@ def build_report(directory: Path, rates_path: Path = RATES_FILE) -> str:
             f"`{parameters['customer_reasoning']['reasoning_effort']}`; judges: upstream's defaults",
             f"- trials {trials}, seed {parameters['seed']}",
             "- instructions: " + (f"SHA-256 `{instructions['sha256']}`, {instructions['bytes']} bytes" if instructions else "none (upstream's policy only)"),
+            *(["- task set: the retail tasks of upstream's base split outside the pinned subset"] if parameters.get("task_set") else []),
             *(["- finish check: on (a reply is held once and asked again before a hand-over to a human, and before the reply "
                f"after a change); replies held: {sum(len(r.get('agent_checks') or []) for r in mine)}"]
               if parameters.get("finish_check") else []),

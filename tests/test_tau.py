@@ -1374,3 +1374,21 @@ class RetailRulesTests(Base):
         for arguments in (base + ["address,nope"], base + ["address,address"], base + ["offers", "--finish-check"], base + ["offers", "--handover-rule"]):
             with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
                 main(arguments)
+
+
+class UnseenTasksTests(Base):
+    """``--unseen``: the tasks of upstream's base split that are outside the pinned subset."""
+
+    def test_the_unseen_tasks_are_the_base_split_without_the_subset(self):
+        unseen, pinned = upstream.unseen_task_ids(), upstream.pinned_task_ids()
+        self.assertEqual((len(unseen), len(set(unseen)), set(unseen) & set(pinned)), (64, 64, set()))
+
+    def test_a_run_takes_an_unseen_task_only_with_the_option_and_records_the_task_set(self):
+        task = upstream.unseen_task_ids()[0]
+        with self.assertRaises(ValueError):
+            run_retail(self.directory, RunParameters("openai", "agent-model", "gpt-6-sol", (task,), 1, 300, None, 1), environment("openai"), ScriptedAgent(TASK))
+        with self.assertRaises(ValueError):  # and a task of the subset is refused with it
+            run_retail(self.directory, RunParameters("openai", "agent-model", "gpt-6-sol", (TASK_ID,), 1, 300, None, 1, unseen=True),
+                       environment("openai"), ScriptedAgent(TASK))
+        self.assertEqual(RunParameters("openai", "m", "gpt-6-sol", (task,), unseen=True).identity()["task_set"], "base split outside the subset")
+        self.assertNotIn("task_set", RunParameters("openai", "m", "gpt-6-sol", (TASK_ID,)).identity())

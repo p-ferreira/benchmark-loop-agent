@@ -48,6 +48,7 @@ class RunParameters:
     finish_check: bool = False
     handover_rule: bool = False
     rules: tuple[str, ...] = ()
+    unseen: bool = False  # the tasks are those of upstream's base split outside the pinned subset
 
     def identity(self) -> dict[str, Any]:
         """Everything that decides which conversations a directory holds and how they were run."""
@@ -58,6 +59,8 @@ class RunParameters:
             identity["handover_rule"] = True
         if self.rules:
             identity["rules"] = sorted(self.rules)
+        if self.unseen:
+            identity["task_set"] = "base split outside the subset"
         return identity
 
     def _identity(self) -> dict[str, Any]:
@@ -232,6 +235,8 @@ def run_retail(directory: Path, parameters: RunParameters, environment: Mapping[
     """Run the conversations of ``parameters`` that are missing or unscored; return every record of the run."""
     check_environment(parameters, environment)
     allowed = upstream.pinned_task_ids()  # the digest check: before the directory is touched and before any request
+    if parameters.unseen:
+        allowed = upstream.unseen_task_ids()
     unknown = [t for t in parameters.task_ids if t not in allowed]
     if unknown or len(set(parameters.task_ids)) != len(parameters.task_ids):
         raise ValueError(f"tasks outside {upstream.SUBSET_NAME} or repeated: {', '.join(unknown) or 'duplicates'}")
