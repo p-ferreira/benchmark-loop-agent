@@ -1,0 +1,63 @@
+{
+  "parameters": {
+    "benchmark": "tau2-bench retail (text, English)",
+    "upstream": {
+      "repository": "sierra-research/tau2-bench",
+      "release": "v2.0.0",
+      "commit": "989d3285ae669e49503324bdb9981bf14fccedeb",
+      "benchmark": "text-v1",
+      "language": "en",
+      "domain": "retail"
+    },
+    "subset": {
+      "name": "retail_50",
+      "sha256": "dc7490f023d1bf9c345edf9c37a8e658298ac3a5be884e012bfb271b3678f2be"
+    },
+    "task_ids": [
+      "22",
+      "59",
+      "71",
+      "74",
+      "19",
+      "49",
+      "56",
+      "64",
+      "23",
+      "42",
+      "6",
+      "97"
+    ],
+    "provider": "openai",
+    "agent_model": "gpt-6-luna",
+    "user_model": "gpt-6-sol",
+    "customer_reasoning": {
+      "reasoning_effort": "low"
+    },
+    "trials": 4,
+    "concurrency": 4,
+    "seed": 300,
+    "trial_seeds": [
+      626729,
+      373753,
+      361454,
+      1567
+    ],
+    "instructions": null,
+    "rules": [
+      "address",
+      "country",
+      "payment",
+      "products"
+    ]
+  },
+  "run_id": "f4e67026969a4083ba6c392b5394fc66",
+  "sessions": [
+    {
+      "number": 1,
+      "concurrency": 4,
+      "started_at": "2026-11-27T16:53:29+00:00",
+      "ended_at": "2026-11-27T16:59:39+00:00",
+      "wall_seconds": 370.022
+    }
+  ]
+}
